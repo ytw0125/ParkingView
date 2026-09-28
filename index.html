@@ -10,6 +10,7 @@
 <meta name="apple-mobile-web-app-title" content="파킹뷰" />
 <meta name="description" content="층별·구역별 실시간 주차 혼잡도와 현장 제보를 한눈에" />
 <title>파킹뷰 · 층별 실시간 주차 현황</title>
+<!-- ParkingView app v3 (2026-09-28) -->
 
 <!-- Fonts / Icons / Map (모두 무료 CDN) -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
@@ -276,6 +277,15 @@
 
 <script>
 'use strict';
+/* =====================================================================
+ * 파킹뷰 버전 기록 (CHANGELOG)
+ *   v1  2026-09-28  첫 프로토타입 (데모 데이터, 층별 현황, 제보·포인트)
+ *   v2  2026-09-28  서울시 시영주차장 실시간 연동 (Cloudflare Worker 프록시)
+ *   v3  2026-09-28  상단 바로가기를 사용자 즐겨찾기로 변경, 버전 표시 추가
+ * ===================================================================== */
+const APP_VERSION = 'v3';
+const APP_BUILD_DATE = '2026-09-28';
+
 /* =====================================================================
  * 1) CONFIG — 백엔드 전환 스위치
  *    DATA_SOURCE 를 'public' 또는 'supabase' 로 바꾸고 키만 채우면
@@ -862,16 +872,73 @@ function closeReward() { $('#reward').classList.add('hidden'); $('#reward').clas
 /* =====================================================================
  * 8) RENDER — 탐색 (헤더 칩 + 대시보드)
  * ===================================================================== */
+/* 헤더 바로가기 = 사용자가 직접 고른 즐겨찾기 (LocalStorage 저장) */
 function renderChips() {
-  const cur = getLot(state.selectedId);
-  $('#chips').innerHTML = HOTSPOTS.map(h => {
-    const l = getLot(h.lotId); if (!l) return '';
-    const t = lotTotals(l), s = statusOf(t.available, t.total);
-    const active = cur && cur.hotspot === h.id;
-    return `<button data-act="hotspot" data-id="${h.lotId}" class="press shrink-0 inline-flex items-center gap-2 h-9 pl-3 pr-3.5 rounded-full text-[13px] font-semibold border ${active ? 'bg-white text-slate-900 border-white' : 'bg-white/[.06] text-slate-200 border-white/10'}">
-      <i class="fa-solid ${h.icon} text-[12px] ${active ? 'text-brand' : 'text-slate-400'}"></i>${h.label}
-      <span class="w-2 h-2 rounded-full" style="background:${s.color}"></span></button>`;
-  }).join('');
+  const favs = Store.data.favorites.map(getLot).filter(Boolean);
+  const manage = `<button data-act="fav-manage" class="press shrink-0 inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full text-[13px] font-semibold border border-dashed border-white/25 text-slate-200">
+      <i class="fa-solid ${favs.length ? 'fa-pen' : 'fa-plus'} text-[11px]"></i>${favs.length ? '편집' : '즐겨찾기 추가'}</button>`;
+  if (!favs.length) {
+    $('#chips').innerHTML = `<span class="shrink-0 inline-flex items-center gap-1.5 h-9 pr-1 text-[12.5px] text-slate-400"><i class="fa-regular fa-star"></i>자주 가는 주차장을 저장해두세요</span>${manage}`;
+    return;
+  }
+  $('#chips').innerHTML = favs.map(l => {
+    const t = lotTotals(l), st = statusOf(t.available, t.total);
+    const active = l.id === state.selectedId;
+    return `<button data-act="goto" data-id="${l.id}" class="press shrink-0 inline-flex items-center gap-2 h-9 pl-3 pr-3.5 rounded-full text-[13px] font-semibold border ${active ? 'bg-white text-slate-900 border-white' : 'bg-white/[.06] text-slate-200 border-white/10'}">
+      <i class="fa-solid fa-star text-[11px] text-amber-400"></i><span class="max-w-[150px] truncate">${esc(l.shortName)}</span>
+      <span class="tnum text-[12px] font-extrabold" style="color:${st.color}">${fmt(t.available)}</span></button>`;
+  }).join('') + manage;
+}
+
+function favRowHTML(l) {
+  const on = Store.data.favorites.includes(l.id);
+  const t = lotTotals(l), st = statusOf(t.available, t.total);
+  return `<div class="flex items-center gap-3 py-2.5">
+    <button data-act="goto" data-id="${l.id}" class="flex-1 min-w-0 text-left">
+      <p class="font-semibold text-[14.5px] truncate">${esc(l.name)}</p>
+      <p class="text-[12px] text-sub truncate">${esc(l.address)}</p>
+    </button>
+    <span class="text-[12px] font-bold tnum shrink-0" style="color:${st.color}">${st.label} ${fmt(t.available)}</span>
+    <button data-act="fav" data-id="${l.id}" class="press w-10 h-10 rounded-full grid place-items-center shrink-0" aria-label="${on ? '즐겨찾기 해제' : '즐겨찾기 추가'}">
+      <i class="fa-${on ? 'solid' : 'regular'} fa-star text-lg ${on ? 'text-amber-400' : 'text-sub'}"></i></button>
+  </div>`;
+}
+
+function renderFavList() {
+  const box = $('#favList'); if (!box) return;
+  const q = ($('#favSearch')?.value || '').trim();
+  const favs = Store.data.favorites.map(getLot).filter(Boolean);
+  const section = (title, body) => `<p class="text-[12px] font-bold text-sub mt-4 mb-1">${title}</p><div class="divide-y divide-line">${body}</div>`;
+  if (q) {
+    const m = searchLots(q);
+    box.innerHTML = m.length ? section('검색 결과', m.map(favRowHTML).join(''))
+      : `<p class="py-8 text-center text-[13px] text-sub">'${esc(q)}' 검색 결과가 없어요</p>`;
+    return;
+  }
+  const ref = refPoint();
+  const near = state.lots.filter(l => !favs.includes(l)).map(l => ({ l, d: haversine(ref, l) }))
+    .sort((a, b) => a.d - b.d).slice(0, 8).map(x => x.l);
+  box.innerHTML =
+    section(`내 즐겨찾기 ${favs.length}`, favs.length ? favs.map(favRowHTML).join('')
+      : '<p class="py-4 text-[13px] text-sub">아직 없어요. 아래에서 별을 눌러 추가하세요.</p>') +
+    section(state.userPos ? '내 주변 주차장' : '가까운 주차장', near.map(favRowHTML).join(''));
+}
+
+function openFavSheet() {
+  Sheet.open(`
+    <div class="flex items-start justify-between gap-3">
+      <div><h3 class="text-[18px] font-extrabold">즐겨찾기 관리</h3>
+        <p class="text-[13px] text-sub mt-0.5">별을 누르면 탐색 화면 위쪽 바로가기에 추가돼요.</p></div>
+      <button data-act="close-sheet" class="press w-9 h-9 rounded-full bg-card2 grid place-items-center shrink-0" aria-label="닫기"><i class="fa-solid fa-xmark text-sub"></i></button>
+    </div>
+    <div class="relative mt-4">
+      <i class="fa-solid fa-magnifying-glass absolute left-4 top-1/2 -translate-y-1/2 text-sub text-sm"></i>
+      <input id="favSearch" type="search" autocomplete="off" placeholder="주차장 이름·지역 검색 (초성 가능)"
+        class="w-full h-11 pl-10 pr-3 rounded-2xl bg-card2 border border-line text-[15px] outline-none" />
+    </div>
+    <div id="favList"></div>`);
+  $('#favSearch').addEventListener('input', renderFavList);
+  renderFavList();
 }
 
 function warningHTML(lot, s, alts) {
@@ -1315,7 +1382,8 @@ function renderMy() {
         <i class="fa-solid fa-rotate-left w-5 text-center"></i><span class="flex-1 font-semibold text-[14.5px]">내 기록 초기화</span>
       </button>
     </section>
-    <p class="text-center text-[11px] text-sub">포인트와 제보 기록은 이 기기의 브라우저에만 저장돼요.</p>`;
+    <p class="text-center text-[11px] text-sub">포인트와 제보 기록은 이 기기의 브라우저에만 저장돼요.</p>
+    <p class="text-center text-[11px] text-sub font-semibold">파킹뷰 ${APP_VERSION} · ${APP_BUILD_DATE}</p>`;
 }
 
 /* =====================================================================
@@ -1506,11 +1574,14 @@ document.addEventListener('click', e => {
     case 'fav': {
       const f = Store.data.favorites;
       const on = f.includes(id);
-      Store.data.favorites = on ? f.filter(x => x !== id) : [id, ...f];
+      Store.data.favorites = on ? f.filter(x => x !== id) : [...f, id];
       Store.save(); renderExplore();
+      if (state.sheetOpen) renderFavList();
+      if (state.tab === 'my') renderMy();
       toast(on ? '즐겨찾기에서 뺐어요' : '즐겨찾기에 추가했어요');
       break;
     }
+    case 'fav-manage': openFavSheet(); break;
     case 'nav': openNavSheet(id); break;
     case 'nav-go': launchNav(el.dataset.app, id); break;
     case 'open-report': state.draft = { lotId: state.selectedId, floor: null }; openReportSheet(); break;
