@@ -10,7 +10,7 @@
 <meta name="apple-mobile-web-app-title" content="파킹뷰" />
 <meta name="description" content="층별·구역별 실시간 주차 혼잡도와 현장 제보를 한눈에" />
 <title>파킹뷰 · 층별 실시간 주차 현황</title>
-<!-- ParkingView app v5 (2026-09-28) -->
+<!-- ParkingView app v7 (2026-09-28) -->
 
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
@@ -174,7 +174,7 @@
           <label for="searchInput" class="sr-only">목적지·주차장 검색</label>
           <i class="fa-solid fa-magnifying-glass absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" aria-hidden="true"></i>
           <input id="searchInput" type="search" autocomplete="off" enterkeyhint="search"
-                 placeholder="목적지 검색 (예: 현대 판교, 스타필드 수원)"
+                 placeholder="어디 가세요? (예: 용산 아이파크몰, 현대 판교)"
                  aria-controls="suggest" aria-autocomplete="list"
                  class="w-full h-12 pl-11 pr-12 rounded-2xl bg-white text-slate-900 placeholder:text-slate-500 text-[15px] font-medium outline-none" />
           <button id="searchClear" class="hidden absolute right-1 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full text-slate-400" aria-label="검색어 지우기"><i class="fa-solid fa-circle-xmark" aria-hidden="true"></i></button>
@@ -287,6 +287,16 @@
  *   v5  2026-09-28  (기획서 v2.1) 목적지 → 주차시설 → 층 구조, 검증된 정보만 표시,
  *                   가상 주차장·가상 실시간 변동 제거, 목적지별 주차 가이드(규칙 기반),
  *                   alias 검색, 데모 모드(기본 꺼짐)
+ *   v6  2026-09-28  (실시간 데이터 연동 패치) 데이터 소스 레지스트리, dataCapability,
+ *                   소스 우선순위, 인천공항 층별 실시간(공공데이터포털) 어댑터,
+ *                   교통안전공단 실시간 어댑터(선택), 제휴(PARTNER) 자리, Case A~D UI
+ *   v7  2026-09-28  (기획서 V2.1 FINAL) 외부 장소 검색(카카오·티맵)으로 모든 실제 장소 검색,
+ *                   목적지·주차장 검색 분리, 주변 실제 주차장(카카오 PK6), DEV_MODE 로 Mock 차단,
+ *                   0 과 null 구분, 혼잡 기준 50/70/90, 가이드 검증 필드, 한국공항공사 어댑터 자리
+ *
+ * 논리 구조(기획서 45장): CONFIG → DATA MODELS(2·3) → DESTINATION SEARCH / PARKING SEARCH(7)
+ *   → API ADAPTERS / DATA NORMALIZER(3) → PARKING LOGIC(5) → GUIDE LOGIC · RECOMMENDATION(8)
+ *   → NAVIGATION(11) → LOCAL STORAGE(4) → APP STATE → UI(12)
  *
  * 원칙: 데이터가 없으면 추측하지 않고 "데이터 없음"을 표시한다.
  *
@@ -295,17 +305,34 @@
  *       → 9 REPORT SYSTEM → 10 POINT SYSTEM → 11 NAVIGATION → 12 UI RENDERING
  *       → 13 EVENT HANDLERS → 14 APP INITIALIZATION
  * ===================================================================== */
-const APP_VERSION = 'v5';
+const APP_VERSION = 'v7';
 const APP_BUILD_DATE = '2026-09-28';
+
+/**
+ * DEV_MODE — Production 에서는 반드시 false.
+ * true 일 때만 데모 수치(DEMO_*)를 켤 수 있는 스위치가 마이 화면에 나타납니다.
+ * false 이면 Mock 주차장·잔여석·혼잡도·층별 데이터·제보는 어디에도 노출되지 않습니다.
+ */
+const DEV_MODE = false;
 
 
 /* =====================================================================
  * 1. CONFIG
  * ===================================================================== */
 const CONFIG = {
-  // 실시간 소스. 'PUBLIC_API' = 서울시 시영주차장 실시간 (Cloudflare Worker 경유)
-  // [교체 지점] 공공데이터포털·Supabase 어댑터를 여기에 추가
-  LIVE_SOURCES: ['PUBLIC_API'],
+  // 실시간 데이터 소스 레지스트리(PARKING_DATA_SOURCES)에서 켤 소스 목록.
+  // optional: true 인 소스는 실패해도 오류 배너를 띄우지 않습니다 (키 미활성 등).
+  LIVE_SOURCES: ['seoulOpenData', 'incheonAirport', 'kacAirports', 'kotsaRealtime'],
+
+  // 외부 장소 검색 (Worker → 카카오 키워드 검색, 실패 시 티맵 POI)
+  PLACE_SEARCH: { enabled: true, minChars: 2, debounceMs: 300 },
+  NEARBY_PARKING_RADIUS: 500,       // 목적지 주변 실제 주차장 (카카오 카테고리 PK6)
+  NEARBY_PARKING_RADIUS_MAX: 1000,
+  SHOW_EXTERNAL_ON_MAP: false,      // 카카오 장소 데이터의 타사 지도 표시는 이용약관 확인 후 켜기
+
+  // 한국공항공사 실시간 주차 (공공데이터포털). 활용신청 후 서비스 정보의 End Point 경로를 넣으세요.
+  //   예) 'B551xxx/서비스명/오퍼레이션'  → Worker /dgk/{경로} 로 호출됩니다. null 이면 사용 안 함.
+  KAC_PARKING_PATH: null,
   STORAGE_BACKEND: 'local', // 'local' | 'supabase' ← [교체 지점]
   PROXY_URL: 'https://parkingview-proxy.ytw060125.workers.dev',
   SUPABASE: {
@@ -329,21 +356,31 @@ const CONFIG = {
   STORAGE_KEY: 'parkview:v1',
 };
 
-const STATUS_THRESHOLDS = { normal: 60, busy: 80, full: 95 }; // 점유율 %: 0~59 여유 / 60~79 보통 / 80~94 혼잡 / 95~ 만차
+// 점유율 %: 0~49 여유 / 50~69 보통 / 70~89 혼잡 / 90~100 매우 혼잡 · 잔여 0대는 만차
+// (전체·잔여가 모두 있을 때만 계산. 공식 API 가 자체 혼잡도를 주면 그 값을 우선)
+const STATUS_THRESHOLDS = { normal: 50, busy: 70, very: 90 };
 const STATUS = {
   free:   { key: 'free',   label: '여유', color: '#10b981', onColor: '#ffffff', icon: 'fa-circle-check',        desc: '빈자리가 많아요' },
   normal: { key: 'normal', label: '보통', color: '#eab308', onColor: '#1f2937', icon: 'fa-circle-half-stroke',   desc: '조금 찾으면 있어요' },
   busy:   { key: 'busy',   label: '혼잡', color: '#f97316', onColor: '#ffffff', icon: 'fa-triangle-exclamation', desc: '한참 돌아야 해요' },
-  full:   { key: 'full',   label: '만차', color: '#ef4444', onColor: '#ffffff', icon: 'fa-circle-xmark',         desc: '자리가 없어요' },
+  very:   { key: 'very',   label: '매우 혼잡', color: '#ef4444', onColor: '#ffffff', icon: 'fa-circle-exclamation', desc: '거의 자리가 없어요' },
+  full:   { key: 'full',   label: '만차', color: '#b91c1c', onColor: '#ffffff', icon: 'fa-circle-xmark',         desc: '자리가 없어요' },
 };
-const STATUS_ORDER = ['free', 'normal', 'busy', 'full'];
+const STATUS_ORDER = ['free', 'normal', 'busy', 'very', 'full'];
+const REPORT_STATUS_ORDER = ['free', 'normal', 'busy', 'full']; // 현장 제보 선택지
 
+/* 데이터 종류 + 화면 표기. 실시간 선택 우선순위: OFFICIAL_REALTIME > PUBLIC_API > PARTNER
+ * (그 다음 USER_REPORT > OFFICIAL(시설 정보) > MOCK). 서로 다른 소스를 합산하지 않는다. */
 const DATA_SOURCE = {
-  OFFICIAL:    { label: '공식 주차 안내 기반', short: '공식 안내', icon: 'fa-building-circle-check' },
-  PUBLIC_API:  { label: '공공데이터 기반',     short: '공공데이터', icon: 'fa-building-columns' },
-  USER_REPORT: { label: '현장 제보',           short: '현장 제보', icon: 'fa-user-check' },
-  MOCK:        { label: '프로토타입 데이터',   short: '프로토타입', icon: 'fa-flask' },
+  OFFICIAL_REALTIME: { label: '실시간 · 공식 데이터', dot: '🟢', short: '공식 실시간', icon: 'fa-tower-broadcast', rank: 1 },
+  PUBLIC_API:        { label: '실시간 · 공공데이터',  dot: '🟢', short: '공공데이터',  icon: 'fa-building-columns', rank: 2 },
+  PARTNER:           { label: '실시간 · 제휴 데이터', dot: '🟢', short: '제휴',        icon: 'fa-handshake', rank: 3 },
+  USER_REPORT:       { label: '현장 제보',            dot: '🔵', short: '현장 제보',   icon: 'fa-user-check', rank: 4 },
+  OFFICIAL:          { label: '시설 정보',            dot: '⚪', short: '시설 정보',   icon: 'fa-building-circle-check', rank: 5 },
+  STATIC:            { label: '시설 정보',            dot: '⚪', short: '시설 정보',   icon: 'fa-map-pin', rank: 6 },
+  MOCK:              { label: '프로토타입 데이터',    dot: '⚪', short: '프로토타입',  icon: 'fa-flask', rank: 9 },
 };
+const LIVE_PRIORITY = ['OFFICIAL_REALTIME', 'PUBLIC_API', 'PARTNER', 'MOCK'];
 
 const CATEGORY = {
   shopping:       { label: '쇼핑몰',       icon: 'fa-bag-shopping' },
@@ -351,6 +388,14 @@ const CATEGORY = {
   convention:     { label: '전시·컨벤션',  icon: 'fa-landmark' },
   airport:        { label: '공항',         icon: 'fa-plane-departure' },
   public_parking: { label: '공영주차장',   icon: 'fa-square-parking' },
+  parking:        { label: '주차장',       icon: 'fa-square-parking' },
+  hospital:       { label: '병원',         icon: 'fa-hospital' },
+  office:         { label: '업무시설',     icon: 'fa-building' },
+  station:        { label: '역·터미널',    icon: 'fa-train' },
+  culture:        { label: '문화시설',     icon: 'fa-masks-theater' },
+  tourism:        { label: '관광명소',     icon: 'fa-camera' },
+  public:         { label: '공공기관',     icon: 'fa-landmark-flag' },
+  place:          { label: '장소',         icon: 'fa-location-dot' },
 };
 
 const NAV_APPS = [
@@ -375,6 +420,10 @@ const REFERENCES = {
   icnValet:      { label: '인천국제공항공사 공식 안내 (공식 주차대행)', url: 'https://www.airport.kr/ap_ko/1014/subview.do' },
   icnT1Parking:  { label: '인천국제공항공사 제1여객터미널 주차장 안내', url: 'https://airport.kr/ap_ko/957/subview.do' },
   icnT2Parking:  { label: '인천국제공항공사 제2여객터미널 주차장 안내', url: 'https://www.airport.kr/ap_ko/958/subview.do' },
+  icnCongestion: { label: '인천국제공항공사 주차장 혼잡도 안내', url: 'https://www.airport.kr/ap_ko/964/subview.do' },
+  icnParkingApi: { label: '인천국제공항공사_주차 정보 (공공데이터포털)', url: 'https://www.data.go.kr/data/15095047/openapi.do' },
+  lotteJamsil:   { label: '롯데백화점 잠실점 공식 안내 (에비뉴엘·월드몰 주차)', url: 'https://www.lotteshopping.com/store/main?cds=03' },
+  lotteMain:     { label: '롯데백화점 본점 공식 주차장 이용약관', url: 'https://www.lotteshopping.com/store/main?cstr=0001' },
 };
 
 /**
@@ -395,6 +444,7 @@ const DESTINATIONS_DATA = [
         floorTips: { B2: { text: '스타필드 수원 B2로 이어지는 보행 연결통로가 있어요.', source: 'OFFICIAL', ref: 'sfSuwonBrief' } } },
     ],
     parkingGuide: {
+      verified: false, verifiedAt: null, // 기획서 제공 내용. 공식 페이지 대조 후 true 로 변경
       summary: '본관 주차장이 혼잡할 경우 대유평공원 주차장을 고려하세요.',
       recommendations: [{
         parkingId: 'starfield-suwon-daeyupyeong', condition: 'when_primary_busy', recommendedFloor: 'B2',
@@ -453,7 +503,11 @@ const DESTINATIONS_DATA = [
   { id: 'lotteworld-mall', name: '롯데월드몰', category: 'shopping',
     aliases: ['롯데월드타워', '잠실 롯데월드몰', '롯데몰 잠실', '월드몰'], keywords: ['잠실', '송파구', '올림픽로'],
     address: '서울 송파구 올림픽로 300', latitude: 37.5125, longitude: 127.1025,
-    facilities: [{ id: 'lotteworld-mall-parking', name: '롯데월드몰 주차장', shortName: '주차장', floors: [], capacity: null }], parkingGuide: null },
+    facilities: [{ id: 'lotteworld-mall-parking', name: '에비뉴엘·월드몰 주차장', shortName: '월드몰 주차장', floors: [], capacity: null,
+      fee: { per10min: 500, note: '평일·주말 10분당 500원' }, dataSource: 'OFFICIAL', ref: 'lotteJamsil' }],
+    parkingGuide: { verified: true, verifiedAt: '2026-09-28', summary: '에비뉴엘·월드몰 주차장과 롯데백화점 잠실점 본관 주차장은 별개로 운영돼요.', recommendations: [], warnings: [],
+      tips: [{ text: '에비뉴엘·월드몰 주차장은 평일·주말 10분당 500원이에요. 백화점 구매 영수증 무료 주차는 본관 주차장 기준이에요.', source: 'OFFICIAL', ref: 'lotteJamsil' }],
+      sources: ['lotteJamsil'] } },
   { id: 'ifc-mall', name: 'IFC몰', category: 'shopping',
     aliases: ['IFC', '아이에프씨몰', '여의도 IFC', 'ifc 몰'], keywords: ['여의도', '국제금융로'],
     address: '서울 영등포구 국제금융로 10', latitude: 37.5252, longitude: 126.9258,
@@ -465,38 +519,51 @@ const DESTINATIONS_DATA = [
   { id: 'lotte-main', name: '롯데백화점 본점', category: 'department',
     aliases: ['롯데 본점', '롯백 본점', '명동 롯데백화점', '소공동 롯데'], keywords: ['명동', '을지로', '소공동'],
     address: '서울 중구 남대문로 81', latitude: 37.5647, longitude: 126.9816,
-    facilities: [{ id: 'lotte-main-parking', name: '롯데백화점 본점 주차장', shortName: '주차장', floors: [], capacity: null }], parkingGuide: null },
+    facilities: [{ id: 'lotte-main-parking', name: '롯데백화점 본점 본관 주차장', shortName: '본관 주차장', floors: [], capacity: null,
+      hours: '10:00~22:00', dataSource: 'OFFICIAL', ref: 'lotteMain' }],
+    parkingGuide: { verified: true, verifiedAt: '2026-09-28', summary: '본관 주차장 기본 운영시간은 백화점·면세점 운영시간 기준 오전 10시~오후 10시예요.', recommendations: [], warnings: [],
+      tips: [{ text: '운영시간 외 심야 주차는 가능하지만 무료·할인 적용이 안 되어 추가 요금이 나올 수 있어요.', source: 'OFFICIAL', ref: 'lotteMain' }],
+      sources: ['lotteMain'] } },
   { id: 'shinsegae-main', name: '신세계백화점 본점', category: 'department',
     aliases: ['신세계 본점', '명동 신세계', '신세계 명동', '신세계백화점 명동'], keywords: ['명동', '회현', '소공로'],
     address: '서울 중구 소공로 63', latitude: 37.5608, longitude: 126.9810,
     facilities: [{ id: 'shinsegae-main-parking', name: '신세계백화점 본점 주차장', shortName: '주차장', floors: [], capacity: null }], parkingGuide: null },
+
+  { id: 'gimpo-airport', name: '김포공항', category: 'airport',
+    aliases: ['김포국제공항', '김포 공항', 'GMP', '김포공항 국내선', '김포공항 국제선'], keywords: ['강서구', '하늘길', '공항'],
+    address: '서울 강서구 하늘길 112', latitude: 37.5587, longitude: 126.7945,
+    facilities: [], // 한국공항공사 실시간 API(KAC_PARKING_PATH) 연결 시 주차장이 자동으로 추가됩니다
+    parkingGuide: null },
 
   /* ---------------- 인천 ---------------- */
   { id: 'icn-t1', name: '인천공항 T1', category: 'airport',
     aliases: ['인천공항', '공항 T1', '인천공항 1터미널', '제1여객터미널', '인천공항 제1터미널', 'T1'], keywords: ['영종도', '공항로', '공항'],
     address: '인천 중구 공항로 272', latitude: 37.4491, longitude: 126.4507,
     facilities: [
-      { id: 'icn-t1-short', name: '제1여객터미널 단기주차장', shortName: 'T1 단기', floors: [], capacity: null, tel: '032-741-6023', dataSource: 'OFFICIAL', ref: 'icnT1Parking' },
-      { id: 'icn-t1-long', name: '제1여객터미널 장기주차장', shortName: 'T1 장기', floors: [], capacity: null, tel: '032-741-6017', dataSource: 'OFFICIAL', ref: 'icnT1Parking', coords: null },
+      { id: 'icn-t1-short', name: '제1여객터미널 단기주차장', shortName: 'T1 단기', floors: [], capacity: null, tel: '032-741-6023', dataSource: 'OFFICIAL', ref: 'icnT1Parking', liveKey: 'T1-SHORT' },
+      { id: 'icn-t1-long', name: '제1여객터미널 장기주차장', shortName: 'T1 장기', floors: [], capacity: null, tel: '032-741-6017', dataSource: 'OFFICIAL', ref: 'icnT1Parking', coords: null, liveKey: 'T1-LONG' },
     ],
     parkingGuide: {
-      summary: '공식 주차대행은 단기주차장 지하 1층에서 접수해요.',
+      verified: true, verifiedAt: '2026-09-28',
+      summary: '공식 주차대행은 단기주차장 지하 1층에서 접수해요. 단기주차장이 혼잡하면 같은 터미널 장기주차장도 확인하세요.',
       recommendations: [],
-      warnings: [],
+      warnings: [{ text: '매일 5~8시, 16~19시에는 주차장 혼잡이 예상돼요. 문의: 제1여객터미널 주차상황실 032-741-7700', source: 'OFFICIAL', ref: 'icnCongestion' }],
       tips: [
         { text: '공식 주차대행 접수장: 단기주차장 지하 1층 B1 A구역 (파란선을 따라 진입). 공식 업체는 (주)하이파킹 032-743-5555예요.', source: 'OFFICIAL', ref: 'icnValet' },
         { text: '출발층 전면도로의 주차대행은 사설(비지정) 업체라 피해 시 보상을 받을 수 없어요.', source: 'OFFICIAL', ref: 'icnValet' },
       ],
-      sources: ['icnValet', 'icnT1Parking'],
+      sources: ['icnValet', 'icnT1Parking', 'icnCongestion'],
     } },
   { id: 'icn-t2', name: '인천공항 T2', category: 'airport',
     aliases: ['인천공항', '공항 T2', '인천공항 2터미널', '제2여객터미널', '인천공항 제2터미널', 'T2'], keywords: ['영종도', '제2터미널대로', '공항'],
     address: '인천 중구 제2터미널대로 446', latitude: 37.4602, longitude: 126.4407,
     facilities: [
-      { id: 'icn-t2-short', name: '제2여객터미널 단기주차장', shortName: 'T2 단기', floors: [], capacity: null, tel: '032-741-0277', dataSource: 'OFFICIAL', ref: 'icnT2Parking' },
-      { id: 'icn-t2-long', name: '제2여객터미널 장기주차장', shortName: 'T2 장기', floors: [], capacity: null, tel: '032-741-0258', dataSource: 'OFFICIAL', ref: 'icnT2Parking', coords: null },
+      { id: 'icn-t2-short', name: '제2여객터미널 단기주차장', shortName: 'T2 단기', floors: [], capacity: null, tel: '032-741-0277', dataSource: 'OFFICIAL', ref: 'icnT2Parking', liveKey: 'T2-SHORT' },
+      { id: 'icn-t2-long', name: '제2여객터미널 장기주차장', shortName: 'T2 장기', floors: [], capacity: null, tel: '032-741-0258', dataSource: 'OFFICIAL', ref: 'icnT2Parking', coords: null, liveKey: 'T2-LONG' },
     ],
-    parkingGuide: null },
+    parkingGuide: { verified: true, verifiedAt: '2026-09-28', summary: '단기주차장이 혼잡하면 같은 터미널 장기주차장도 확인하세요.', recommendations: [],
+      warnings: [{ text: '매일 5~8시, 16~19시에는 주차장 혼잡이 예상돼요. 문의: 제2여객터미널 주차상황실 032-741-0260', source: 'OFFICIAL', ref: 'icnCongestion' }],
+      tips: [], sources: ['icnT2Parking', 'icnCongestion'] } },
 ];
 
 /** 데모 수치 (dataSource: MOCK). 데모 모드에서만 사용. { 층: [전체, 잔여] } 또는 { _total: [전체, 잔여] } */
@@ -524,11 +591,29 @@ const DEMO_REPORTS = [
  *   { id, destinationId, name, shortName, lat, lng,
  *     floors: [{ id, name, tip }],       // 공식 확인된 구조만
  *     capacity, info: { dataSource, ref } | null, fee, hours, tel }
- * Live (실시간 수치, 별도 보관 — state.live[facilityId])
- *   { dataSource:'PUBLIC_API'|'MOCK', updatedAt, total, available, realtime,
- *     floors: { B3: { total, available } } | null }
+ * Live (실시간 수치, 소스별 보관 — state.liveBySource[sourceId][facilityId]) → 아래 makeLive 참고
  * ===================================================================== */
 const floorName = id => { const m = /^B(\d+)$/.exec(id); if (m) return `지하 ${m[1]}층`; const g = /^(\d+)F$/.exec(id); return g ? `지상 ${g[1]}층` : id; };
+
+/**
+ * Guide 정규화 (기획서 24장 구조)
+ *   { verified, verifiedAt, summary, alternatives: [{ parkingId, reason, walkingDistance, walkingMinutes,
+ *     connection, recommendedWhen, recommendedFloor, source, ref }], warnings, tips, sources }
+ * 확인되지 않은 도보거리·시간·연결통로는 null 로 두고 화면에 표시하지 않는다.
+ */
+function normalizeGuide(g) {
+  if (!g) return null;
+  const alts = (g.alternatives || g.recommendations || []).map(r => ({
+    parkingId: r.parkingId, reason: r.reason || '', recommendedFloor: r.recommendedFloor || null,
+    walkingDistance: r.walkingDistance == null ? null : r.walkingDistance,
+    walkingMinutes: r.walkingMinutes != null ? r.walkingMinutes : r.walkingTime != null ? r.walkingTime : null,
+    connection: r.connection || r.connectionType || null,
+    recommendedWhen: r.recommendedWhen || r.condition || 'always',
+    source: r.source || null, ref: r.ref || null,
+  }));
+  return { verified: !!g.verified, verifiedAt: g.verifiedAt || null, summary: g.summary || '',
+    alternatives: alts, warnings: g.warnings || [], tips: g.tips || [], sources: g.sources || [] };
+}
 
 function buildModelsFromReference() {
   const destinations = [], facilities = [];
@@ -543,30 +628,59 @@ function buildModelsFromReference() {
         floors: (f.floors || []).map(id => ({ id, name: floorName(id), tip: f.floorTips && f.floorTips[id] ? f.floorTips[id] : null })),
         capacity: f.capacity == null ? null : f.capacity,
         info: f.dataSource ? { dataSource: f.dataSource, ref: f.ref } : null,
-        fee: null, hours: null, tel: f.tel || null,
+        fee: f.fee ? { free: false, hourly: f.fee.hourly || null, per10min: f.fee.per10min || null, note: f.fee.note || '' } : null,
+        hours: f.hours || null, tel: f.tel || null, liveKey: f.liveKey || null,
       });
       ids.push(f.id);
     });
     destinations.push({
       id: d.id, kind: 'destination', name: d.name, aliases: d.aliases || [], keywords: d.keywords || [],
       category: d.category, address: d.address, lat: d.latitude, lng: d.longitude,
-      facilityIds: ids, guide: d.parkingGuide || null,
+      facilityIds: ids, nearbyParkingIds: [], guide: normalizeGuide(d.parkingGuide),
     });
   });
   return { destinations, facilities };
 }
 
+/**
+ * Standard Live Model (어댑터 출력 → state.liveBySource[sourceId][facilityId])
+ *   { dataSource, provider, updatedAt, realtime,
+ *     total, available,                       // 없으면 null
+ *     availabilityFlag: 'available'|'limited'|null,   // Case C (가능 여부만 제공)
+ *     floors: { [floorId]: { name, total, available } } | null,
+ *     floorOrder: [floorId] | null,
+ *     capability: { realtime, floorLevel, availableSpaces, occupancy } }
+ */
+function makeLive(o) {
+  const floors = o.floors && Object.keys(o.floors).length ? o.floors : null;
+  let total = o.total, available = o.available;
+  if (floors && (total == null || available == null)) {
+    total = 0; available = 0;
+    Object.values(floors).forEach(f => { total += f.total || 0; available += f.available || 0; });
+  }
+  const hasNums = total != null && available != null && total > 0;
+  return {
+    dataSource: o.dataSource, provider: o.provider || '', updatedAt: o.updatedAt || Date.now(), realtime: o.realtime !== false,
+    total: hasNums ? total : null, available: hasNums ? available : null,
+    availabilityFlag: o.availabilityFlag || null, floors, floorOrder: floors ? (o.floorOrder || Object.keys(floors)) : null,
+    capability: { realtime: o.realtime !== false, floorLevel: !!floors, availableSpaces: hasNums, occupancy: hasNums },
+  };
+}
+
 function demoLive(facilityId) {
   const d = DEMO_AVAILABILITY[facilityId];
   if (!d) return null;
-  const floors = {};
-  let total = 0, available = 0;
-  Object.entries(d).forEach(([k, [t, a]]) => { total += t; available += a; if (k !== '_total') floors[k] = { total: t, available: a }; });
-  return { dataSource: 'MOCK', updatedAt: state.bootAt, total, available, realtime: true, floors: Object.keys(floors).length ? floors : null };
+  const floors = {}; let total = null, available = null;
+  Object.entries(d).forEach(([k, [t, a]]) => { if (k === '_total') { total = t; available = a; } else floors[k] = { name: floorName(k), total: t, available: a }; });
+  return makeLive({ dataSource: 'MOCK', provider: '프로토타입', updatedAt: state.bootAt, total, available, floors });
 }
 
-/* 서울시 시영주차장 실시간 (Worker /seoul/lots) → Destination + Facility + Live */
+/* 서울시 시영주차장 실시간 (Worker /seoul/lots) → Destination + Facility + Live (전체 잔여석만: Case B) */
 function parseKst(s) { const t = s ? Date.parse(String(s).replace(' ', 'T') + '+09:00') : NaN; return isNaN(t) ? null : t; }
+function parseCompactKst(s) { // "20260928131523" 또는 "20260928131523.000"
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?/.exec(String(s || ''));
+  return m ? Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}+09:00`) : null;
+}
 function fmtHours(h) {
   if (!h || !h.wdStart) return null;
   if (h.wdStart === '0000' && (h.wdEnd === '2400' || h.wdEnd === '0000')) return '24시간';
@@ -583,32 +697,212 @@ function seoulFee(r) {
   if (f.dayMax > 0) hourly = Math.min(hourly, f.dayMax);
   return { free: false, hourly, per10min: per10 };
 }
-const SeoulPublicApiAdapter = {
-  id: 'PUBLIC_API',
+const emptyOut = () => ({ destinations: [], facilities: [], live: {} });
+
+const SeoulOpenDataAdapter = {
+  id: 'seoulOpenData', label: '서울시 시영주차장 실시간', optional: false,
   async fetch() {
     const res = await fetch(CONFIG.PROXY_URL + '/seoul/lots');
     if (!res.ok) throw new Error('proxy ' + res.status);
     const j = await res.json();
     if (j.ok === false) throw new Error(j.error || 'seoul error');
-    const destinations = [], facilities = [], live = {};
+    const out = emptyOut();
     (j.lots || []).filter(r => r.lat && r.lng && r.total > 0).forEach(r => {
-      const id = 'seoul-' + r.id;
-      const name = String(r.name);
-      destinations.push({ id, kind: 'public_lot', name, aliases: [name.replace(/\s*\((시|구)\)\s*$/, '')], keywords: ['공영', '시영', '공영주차장', r.type || ''],
+      const id = 'seoul-' + r.id, name = String(r.name), short = name.replace(/\s*\((시|구)\)\s*$/, '');
+      out.destinations.push({ id, kind: 'public_lot', name, aliases: [short], keywords: ['공영', '시영', '공영주차장', r.type || ''],
         category: 'public_parking', address: '서울 ' + (r.addr || ''), lat: +r.lat, lng: +r.lng, facilityIds: [id], guide: null });
-      facilities.push({ id, destinationId: id, name, shortName: name.replace(/\s*\((시|구)\)\s*$/, ''), lat: +r.lat, lng: +r.lng,
-        floors: [], capacity: null, info: { dataSource: 'PUBLIC_API', ref: null }, fee: seoulFee(r), hours: fmtHours(r.hours), tel: r.tel || null });
+      out.facilities.push({ id, destinationId: id, name, shortName: short, lat: +r.lat, lng: +r.lng, floors: [], capacity: null,
+        info: null, fee: seoulFee(r), hours: fmtHours(r.hours), tel: r.tel || null, liveKey: null });
       const total = Math.round(+r.total), available = Math.min(total, Math.max(0, Math.round(+r.available || 0)));
-      live[id] = { dataSource: 'PUBLIC_API', updatedAt: parseKst(r.updatedAt) || Date.now(), total, available, realtime: !!r.realtime, floors: null };
+      out.live[id] = makeLive({ dataSource: 'PUBLIC_API', provider: '서울 열린데이터광장', updatedAt: parseKst(r.updatedAt) || Date.now(), realtime: !!r.realtime, total, available });
     });
-    return { destinations, facilities, live };
+    return out;
   },
 };
 
-/** [교체 지점] 공공데이터포털 / Supabase 어댑터는 같은 형태({ destinations, facilities, live })를 반환하면 됩니다 */
-const PublicDataPortalAdapter = { id: 'DATA_GO_KR', async fetch() { return { destinations: [], facilities: [], live: {} }; } };
-const SupabaseAdapter = { id: 'SUPABASE', async fetch() { return { destinations: [], facilities: [], live: {} }; } };
-const LIVE_ADAPTERS = { PUBLIC_API: SeoulPublicApiAdapter, DATA_GO_KR: PublicDataPortalAdapter, SUPABASE: SupabaseAdapter };
+/**
+ * 인천국제공항공사_주차 정보 (공공데이터포털, Worker /icn/parking)
+ * 구역 예: "T1 단기주차장 지하1층", "T1 장기주차장 P1", "T2 장기 주차타워" …
+ * ※ 응답 필드명은 활용가이드 기준으로 여러 후보를 허용합니다. 매핑 실패 시 해당 행을 건너뜁니다.
+ */
+function icnAreaKey(label) {
+  const s = String(label || '').replace(/\s/g, '');
+  const term = /T2|제2/.test(s) ? 'T2' : /T1|제1/.test(s) ? 'T1' : null;
+  const lot = /단기/.test(s) ? 'SHORT' : /장기|주차타워|P\d/.test(s) ? 'LONG' : null;
+  if (!term || !lot) return null;
+  let floorId = null;
+  const b = /지하(\d)층/.exec(s); if (b) floorId = 'B' + b[1];
+  else if (/지상/.test(s)) floorId = '1F';
+  const p = /주차타워/.test(s) ? ('타워' + ((/P(\d)/.exec(s) || [])[1] || '')) : (/P(\d)/.exec(s) || [])[0];
+  if (!floorId && p) floorId = p;
+  return floorId ? { key: `${term}-${lot}`, floorId, name: floorId.startsWith('B') || floorId === '1F' ? floorName(floorId) : String(label).replace(/^.*?(장기|단기)\s*(주차장)?\s*/, '') || floorId } : null;
+}
+const IncheonAirportAdapter = {
+  id: 'incheonAirport', label: '인천국제공항 주차 현황', optional: true,
+  async fetch() {
+    const res = await fetch(CONFIG.PROXY_URL + '/icn/parking?numOfRows=100');
+    if (!res.ok) throw new Error('proxy ' + res.status);
+    const j = await res.json();
+    const body = j.response ? j.response.body : j.body;
+    let items = body && body.items ? (body.items.item || body.items) : null;
+    if (!items) throw new Error('icn: ' + JSON.stringify(j).slice(0, 160));
+    if (!Array.isArray(items)) items = [items];
+    const groups = {};
+    items.forEach(it => {
+      const label = it.floor || it.parkingName || it.parkinglot || it.name;
+      const area = icnAreaKey(label);
+      const parked = Number(it.parking != null ? it.parking : it.parkingCnt), total = Number(it.parkingarea != null ? it.parkingarea : it.parkingArea);
+      if (!area || !(total > 0) || isNaN(parked)) return;
+      const g = groups[area.key] || (groups[area.key] = { floors: {}, order: [], at: 0 });
+      if (!g.floors[area.floorId]) g.order.push(area.floorId);
+      g.floors[area.floorId] = { name: area.name, total, available: Math.max(0, total - parked) };
+      g.at = Math.max(g.at, parseCompactKst(it.datetm || it.datetime) || 0);
+    });
+    const out = emptyOut();
+    state.facilities.filter(f => f.liveKey && groups[f.liveKey]).forEach(f => {
+      const g = groups[f.liveKey];
+      out.live[f.id] = makeLive({ dataSource: 'OFFICIAL_REALTIME', provider: '인천국제공항공사', updatedAt: g.at || Date.now(), floors: g.floors, floorOrder: g.order });
+    });
+    if (!Object.keys(out.live).length) throw new Error('icn: 매핑된 주차장 없음');
+    return out;
+  },
+};
+
+/**
+ * 한국교통안전공단 주차정보 (전국, Worker /kotsa/*) — 키 활성화 전에는 조용히 실패
+ * [교체 지점] 필드명은 활용가이드 확인 후 보정. 좌표·총면수·잔여면이 모두 있는 행만 사용.
+ */
+const KotsaRealtimeAdapter = {
+  id: 'kotsaRealtime', label: '전국 주차장 실시간 (교통안전공단)', optional: true,
+  async fetch() {
+    const get = async p => { const r = await fetch(CONFIG.PROXY_URL + p); if (!r.ok) throw new Error('kotsa ' + r.status); return r.json(); };
+    const [info, rt] = await Promise.all([get('/kotsa/info?numOfRows=1000'), get('/kotsa/realtime?numOfRows=1000')]);
+    const infoRows = info.PrkSttusInfo || (info.response && info.response.body && info.response.body.items) || [];
+    const rtRows = rt.PrkRealtimeInfo || (rt.response && rt.response.body && rt.response.body.items) || [];
+    if (!Array.isArray(infoRows) || !Array.isArray(rtRows) || !rtRows.length) throw new Error('kotsa: 데이터 없음 또는 키 미활성');
+    const rtMap = new Map(rtRows.map(x => [x.prk_center_id, x]));
+    const out = emptyOut();
+    infoRows.forEach(x => {
+      const r = rtMap.get(x.prk_center_id); if (!r) return;
+      const lat = parseFloat(x.prk_plce_entrc_la), lng = parseFloat(x.prk_plce_entrc_lo);
+      const total = Number(r.pkfc_ParkingLots_total || x.prk_cmprt_co), available = Number(r.pkfc_Available_ParkingLots_total);
+      if (!(lat && lng && total > 0) || isNaN(available)) return;
+      const id = 'kotsa-' + x.prk_center_id, name = String(x.prk_plce_nm || '주차장');
+      if (state.facilities.some(f => hasCoords(f) && calculateDistance(f.lat, f.lng, lat, lng) < 30 && getLiveFromSource('seoulOpenData', f.id))) return; // 서울 데이터와 중복 방지
+      out.destinations.push({ id, kind: 'public_lot', name, aliases: [], keywords: ['공영', '주차장'], category: 'public_parking',
+        address: x.prk_plce_adres || '', lat, lng, facilityIds: [id], guide: null });
+      out.facilities.push({ id, destinationId: id, name, shortName: name, lat, lng, floors: [], capacity: null, info: null, fee: null, hours: null, tel: null, liveKey: null });
+      out.live[id] = makeLive({ dataSource: 'PUBLIC_API', provider: '한국교통안전공단', updatedAt: Date.now(), total, available: Math.min(total, Math.max(0, available)) });
+    });
+    return out;
+  },
+};
+
+/**
+ * 한국공항공사_전국공항 실시간 주차정보 (김포·김해·제주 등). CONFIG.KAC_PARKING_PATH 가 설정됐을 때만 동작.
+ * ※ 응답 필드는 활용가이드 확인 후 보정 필요 — 공항명/주차장명/주차가능면수/입차차량수 후보를 모두 허용
+ */
+const KacAirportsAdapter = {
+  id: 'kacAirports', label: '한국공항공사 공항 주차 현황', optional: true,
+  async fetch() {
+    if (!CONFIG.KAC_PARKING_PATH) { const e = new Error('KAC_PARKING_PATH 미설정'); e.disabled = true; throw e; }
+    const r = await fetch(`${CONFIG.PROXY_URL}/dgk/${CONFIG.KAC_PARKING_PATH}?numOfRows=100&pageNo=1&type=json&_type=json`);
+    if (!r.ok) throw new Error('kac ' + r.status);
+    const j = await r.json();
+    const body = j.response ? j.response.body : j.body;
+    let items = body && body.items ? (body.items.item || body.items) : null;
+    if (!items) throw new Error('kac: ' + JSON.stringify(j).slice(0, 160));
+    if (!Array.isArray(items)) items = [items];
+    const out = emptyOut();
+    const gimpo = getDestination('gimpo-airport');
+    items.forEach((it, i) => {
+      const airport = String(it.aprKor || it.airportName || it.airport || '');
+      if (!/김포|GMP/.test(airport)) return; // 현재는 김포공항만 목적지에 연결
+      const name = String(it.parkingAirportCodeName || it.parkingName || it.parkinglot || it.prkplceNm || `주차장 ${i + 1}`);
+      const total = Number(it.parkingFullSpace != null ? it.parkingFullSpace : it.parkingTotal != null ? it.parkingTotal : it.totalSpace);
+      const available = it.parkingFreeSpace != null ? Number(it.parkingFreeSpace) : it.parkingAvail != null ? Number(it.parkingAvail) : null;
+      const entered = it.parkingIstay != null ? Number(it.parkingIstay) : it.parkingInCnt != null ? Number(it.parkingInCnt) : null;
+      const avail = available != null && !isNaN(available) ? available : (total > 0 && entered != null && !isNaN(entered) ? Math.max(0, total - entered) : null);
+      if (!(total > 0) || avail == null) return;
+      const id = 'kac-' + name.replace(/\s/g, '');
+      if (!getFacility(id)) out.facilities.push({ id, destinationId: 'gimpo-airport', name: `김포공항 ${name}`, shortName: name,
+        lat: gimpo ? gimpo.lat : null, lng: gimpo ? gimpo.lng : null, floors: [], capacity: null, info: null, fee: null, hours: null, tel: null, liveKey: null });
+      if (gimpo && !gimpo.facilityIds.includes(id)) gimpo.facilityIds.push(id);
+      out.live[id] = makeLive({ dataSource: 'OFFICIAL_REALTIME', provider: '한국공항공사', updatedAt: parseCompactKst(it.sysGetdate || it.datetm) || Date.now(), total, available: Math.min(total, avail) });
+    });
+    if (!Object.keys(out.live).length) throw new Error('kac: 매핑된 주차장 없음');
+    return out;
+  },
+};
+
+/* ---------------- 장소 검색 어댑터 (Destination 검색용, 주차 DB 와 독립) ---------------- */
+const KAKAO_CATEGORY = { MT1: 'shopping', CS2: 'shopping', PK6: 'parking', HP8: 'hospital', CT1: 'culture', AT4: 'tourism', OL7: 'etc', SW8: 'station', PO3: 'public' };
+function categoryFromPlace(p) {
+  if (p.group === 'PK6' || /주차장/.test(p.category)) return 'parking';
+  if (/백화점/.test(p.category)) return 'department';
+  if (/공항/.test(p.category) || /공항/.test(p.name)) return 'airport';
+  if (/쇼핑|몰|아울렛/.test(p.category)) return 'shopping';
+  if (/병원/.test(p.category)) return 'hospital';
+  if (/전시|컨벤션|문화/.test(p.category)) return 'convention';
+  if (/역|터미널/.test(p.category)) return 'station';
+  if (/빌딩|오피스|사무/.test(p.category)) return 'office';
+  return KAKAO_CATEGORY[p.group] || 'place';
+}
+const PlaceSearchAdapter = {
+  cache: new Map(),
+  async search(q, near) {
+    const key = q + '|' + (near ? near.lat.toFixed(2) + ',' + near.lng.toFixed(2) : '');
+    if (this.cache.has(key)) return this.cache.get(key);
+    const qs = new URLSearchParams({ q });
+    if (near) { qs.set('x', near.lng); qs.set('y', near.lat); }
+    const r = await fetch(`${CONFIG.PROXY_URL}/places/search?${qs}`);
+    if (!r.ok) throw new Error('place ' + r.status);
+    const j = await r.json();
+    const out = { provider: j.provider, places: (j.places || []).map(p => ({ ...p, kind: categoryFromPlace(p) })) };
+    this.cache.set(key, out);
+    return out;
+  },
+};
+const NearbyParkingAdapter = {
+  cache: new Map(),
+  async around(lat, lng, radius) {
+    const key = `${lat.toFixed(4)},${lng.toFixed(4)},${radius}`;
+    if (this.cache.has(key)) return this.cache.get(key);
+    const r = await fetch(`${CONFIG.PROXY_URL}/places/parking?lat=${lat}&lng=${lng}&radius=${radius}`);
+    if (!r.ok) throw new Error('parking ' + r.status);
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    this.cache.set(key, j.places || []);
+    return j.places || [];
+  },
+};
+/** 외부 장소 → Destination (주차 데이터가 없어도 목적지로 성립) */
+function destinationFromPlace(p) {
+  return { id: 'place-' + p.id, kind: 'external', provider: p.provider, name: p.name, aliases: [], keywords: [],
+    category: p.kind, placeCategory: p.category, address: p.roadAddress || p.address, lat: p.lat, lng: p.lng,
+    phone: p.phone || null, url: p.url || null, facilityIds: [], nearbyParkingIds: [], guide: null };
+}
+/** 외부 주차장 → 정적 Parking Facility (sourceType STATIC, 실시간 없음) */
+function facilityFromPlace(p, destinationId = null) {
+  return { id: 'pk-' + p.id, destinationId, name: p.name, shortName: p.name, lat: p.lat, lng: p.lng,
+    address: p.roadAddress || p.address, floors: [], capacity: null, info: { dataSource: 'STATIC', ref: null, provider: p.provider === 'tmap' ? 'TMAP 장소' : '카카오 장소' },
+    fee: null, hours: null, tel: p.phone || null, liveKey: null, external: true, liveRef: null };
+}
+
+/** [교체 지점] 운영사 제휴 데이터 (예: 백화점·쇼핑몰 주차관제). 같은 { destinations, facilities, live } 형태로 반환 */
+const PartnerDataAdapter = { id: 'partner', label: '제휴 주차 데이터', optional: true, async fetch() { return emptyOut(); } };
+/** [교체 지점] Supabase parking_lots / parking_floors */
+const SupabaseAdapter = { id: 'supabase', label: 'ParkingView DB', optional: true, async fetch() { return emptyOut(); } };
+
+/** 데이터 소스 레지스트리 — 새 API 는 어댑터를 만들어 여기에 등록 */
+const PARKING_DATA_SOURCES = {
+  seoulOpenData: SeoulOpenDataAdapter,
+  incheonAirport: IncheonAirportAdapter,
+  kacAirports: KacAirportsAdapter,
+  kotsaRealtime: KotsaRealtimeAdapter,
+  partner: PartnerDataAdapter,
+  supabase: SupabaseAdapter,
+};
 
 const Repository = {
   loadReference() {
@@ -617,23 +911,25 @@ const Repository = {
     state.sources.REFERENCE = 'ok';
   },
   async loadLive(sourceId) {
-    const adapter = LIVE_ADAPTERS[sourceId];
+    const adapter = PARKING_DATA_SOURCES[sourceId];
     if (!adapter) return;
     if (state.sources[sourceId] !== 'ok') state.sources[sourceId] = 'loading';
     try {
       const out = await adapter.fetch();
       out.destinations.forEach(d => { if (!getDestination(d.id)) state.destinations.push(d); });
-      out.facilities.forEach(f => { const cur = getFacility(f.id); if (cur) Object.assign(cur, { fee: f.fee, hours: f.hours }); else state.facilities.push(f); });
-      Object.assign(state.live, out.live);
+      out.facilities.forEach(f => { const cur = getFacility(f.id); if (cur) Object.assign(cur, { fee: f.fee || cur.fee, hours: f.hours || cur.hours }); else state.facilities.push(f); });
+      state.liveBySource[sourceId] = { ...(state.liveBySource[sourceId] || {}), ...out.live };
       state.sources[sourceId] = 'ok';
+      state.sourceCheckedAt[sourceId] = Date.now();
     } catch (e) {
-      console.warn(`[${sourceId}] 로드 실패`, e);
+      if (e && e.disabled) { state.sources[sourceId] = 'disabled'; return; }
+      console.warn(`[${sourceId}] 로드 실패`, e && e.message ? e.message : e);
       if (state.sources[sourceId] !== 'ok') state.sources[sourceId] = 'error';
     }
   },
   loadReports() {
     const mine = Store.data.reports.map(r => ({ ...r, createdAt: toMs(r.createdAt), mine: true, nick: '나' }));
-    const demo = Store.data.settings.demo
+    const demo = DEV_MODE && Store.data.settings.demo
       ? DEMO_REPORTS.map((r, i) => ({ id: 'demo' + i, ...r, createdAt: state.bootAt - r.minutesAgo * 60000, points: 0, nick: '데모', mine: false, demo: true }))
       : [];
     state.reports = [...mine, ...demo].sort((a, b) => b.createdAt - a.createdAt);
@@ -665,8 +961,9 @@ const LEGACY_ID_MAP = { 'sf-main': 'starfield-hanam', 'ss-main': 'shinsegae-main
 
 const Store = {
   data: null,
-  defaults: () => ({ schema: 3, uid: null, user: { points: 0, reportCount: 0 }, reports: [], favorites: [],
-    recentQueries: [], recentDestinations: [], badges: [], theme: null, lastDestination: null, settings: { demo: false } }),
+  defaults: () => ({ schema: 4, uid: null, user: { points: 0, reportCount: 0 }, reports: [], favorites: [],
+    recentQueries: [], recentDestinations: [], badges: [], theme: null, lastDestination: null, settings: { demo: false },
+    placeSnapshots: {} }), // 외부 검색으로 연 목적지(즐겨찾기·최근 목록 복원용). 최대 40개
   load() {
     const raw = LocalStorageAdapter.read();
     const d = { ...this.defaults(), ...raw };
@@ -682,7 +979,9 @@ const Store = {
     d.recentDestinations = [...new Set((raw.recentDestinations || raw.recentLots || raw.recent || []).map(mapId))];
     d.lastDestination = raw.lastDestination || (raw.lastLot ? mapId(raw.lastLot) : null);
     ['points', 'recent', 'recentLots', 'lastLot', 'cooldowns', 'seenBadges'].forEach(k => delete d[k]);
-    d.schema = 3;
+    d.placeSnapshots = raw.placeSnapshots || {};
+    if (!DEV_MODE) d.settings.demo = false; // Production 에서는 데모 강제 해제
+    d.schema = 4;
     if (!d.uid) d.uid = String(Math.floor(1000 + Math.random() * 9000));
     this.data = d; this.save();
   },
@@ -695,10 +994,13 @@ const Store = {
  * ------------------------------------------------------------------- */
 const state = {
   bootAt: Date.now(),
-  destinations: [], facilities: [], live: {}, reports: [],
+  destinations: [], facilities: [], liveBySource: {}, reports: [],
   selectedDestId: null, selectedFacilityId: null, pendingDestId: null,
   tab: 'explore',
-  sources: { REFERENCE: 'idle', PUBLIC_API: 'idle' },
+  sources: { REFERENCE: 'idle', seoulOpenData: 'idle', incheonAirport: 'idle', kacAirports: 'idle', kotsaRealtime: 'idle' },
+  sourceCheckedAt: {},
+  search: { q: '', external: null, status: 'idle' },   // 외부 장소 검색 상태
+  nearby: { destId: null, radius: 0, status: 'idle', ids: [] }, // 목적지 주변 실제 주차장
   geo: { status: 'idle', pos: null }, geoAsked: false,
   draft: { parkingId: null, floorId: null, status: null },
   nearbySort: 'distance', nearbyRadius: CONFIG.NEARBY_DEFAULT_RADIUS,
@@ -724,21 +1026,54 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 function calculateOccupancyRate(totalSpaces, availableSpaces) { return totalSpaces ? ((totalSpaces - availableSpaces) / totalSpaces) * 100 : 100; }
 function statusFromOccupancy(rate) {
   const r = Math.round(rate);
-  if (r >= STATUS_THRESHOLDS.full) return STATUS.full;
+  if (r >= STATUS_THRESHOLDS.very) return STATUS.very;
   if (r >= STATUS_THRESHOLDS.busy) return STATUS.busy;
   if (r >= STATUS_THRESHOLDS.normal) return STATUS.normal;
   return STATUS.free;
 }
-function statusOf(available, total) { if (!total || available <= 0) return STATUS.full; return statusFromOccupancy(calculateOccupancyRate(total, available)); }
-const statusLabel = (st, available) => (st.key === 'full' && available > 0 ? '만차 임박' : st.label);
+/** 0 과 null 을 구분: available === 0 → 만차 / null → 판단 불가(null 반환) */
+function statusOf(available, total) {
+  if (available == null || total == null || !(total > 0)) return null;
+  if (available <= 0) return STATUS.full;
+  return statusFromOccupancy(calculateOccupancyRate(total, available));
+}
+const statusLabel = st => st.label;
 const occPct = (total, available) => Math.round(calculateOccupancyRate(total, available));
 
-/** 실시간 수치. 공공데이터는 항상, MOCK 은 데모 모드에서만 */
+const getLiveFromSource = (sourceId, facilityId) => (state.liveBySource[sourceId] || {})[facilityId] || null;
+/**
+ * 실시간 데이터 선택 (합산하지 않고 우선순위가 가장 높은 소스 하나만 사용)
+ *   OFFICIAL_REALTIME > PUBLIC_API > PARTNER > (데모 모드일 때만) MOCK
+ */
 function getLive(facilityId) {
-  if (state.live[facilityId]) return state.live[facilityId];
-  return Store.data.settings.demo ? demoLive(facilityId) : null;
+  const f0 = getFacility(facilityId);
+  if (f0 && f0.liveRef) return getLive(f0.liveRef); // 외부 주차장 ↔ 실시간 소스 연결
+  const cands = Object.values(state.liveBySource).map(m => m[facilityId]).filter(Boolean);
+  if (cands.length) return cands.sort((a, b) => LIVE_PRIORITY.indexOf(a.dataSource) - LIVE_PRIORITY.indexOf(b.dataSource))[0];
+  return DEV_MODE && Store.data.settings.demo ? demoLive(facilityId) : null;
 }
 function getFloorLive(facilityId, floorId) { const l = getLive(facilityId); return l && l.floors ? l.floors[floorId] || null : null; }
+/** 화면에 그릴 층 목록 = 공식 층 구조 ∪ 실시간 데이터가 제공하는 층 (원본 순서 유지) */
+function displayFloors(f) {
+  const live = getLive(f.id), list = f.floors.map(x => ({ ...x }));
+  if (live && live.floors) (live.floorOrder || Object.keys(live.floors)).forEach(id => { if (!list.some(x => x.id === id)) list.push({ id, name: live.floors[id].name || floorName(id), tip: null }); });
+  return list;
+}
+/** 주차시설이 제공하는 데이터 수준 (기획서 dataCapability) */
+function dataCapability(f) {
+  const live = getLive(f.id);
+  return {
+    realtime: !!(live && live.capability.realtime && live.dataSource !== 'MOCK'),
+    floorLevel: !!(live && live.capability.floorLevel),
+    availableSpaces: !!(live && live.capability.availableSpaces),
+    occupancy: !!(live && live.capability.occupancy),
+    totalSpaces: !!((live && live.total) || f.capacity),
+    updatedAt: !!live,
+    floorStructure: f.floors.length > 0,
+    source: live ? live.dataSource : f.info ? f.info.dataSource : null,
+    caseType: !live ? 'D' : live.capability.floorLevel ? 'A' : live.capability.availableSpaces ? 'B' : live.availabilityFlag ? 'C' : 'D',
+  };
+}
 
 const minutesSince = ts => (Date.now() - ts) / 60000;
 /** 제보 최신성: 0~10 최신 · 10~30 최근 · 30~60 참고 · 60+ 오래된 제보 */
@@ -768,22 +1103,25 @@ function reportSummary(parkingId, floorId) {
  *   2) 없으면 최근 30분 안의 현장 제보 중 가장 최신 것
  *   3) 둘 다 없으면 unknown
  */
+const FLAG_STATUS = { available: { ...STATUS.free, label: '주차 가능' }, limited: { ...STATUS.busy, label: '혼잡 가능성' } };
 function facilityStatus(f) {
   const live = getLive(f.id);
-  if (live) return { basis: 'live', status: statusOf(live.available, live.total), live, dataSource: live.dataSource, at: live.updatedAt };
+  if (live && live.total != null) return { basis: 'live', status: statusOf(live.available, live.total), live, dataSource: live.dataSource, at: live.updatedAt };
+  if (live && live.availabilityFlag) return { basis: 'flag', status: FLAG_STATUS[live.availabilityFlag], live, dataSource: live.dataSource, at: live.updatedAt };
   const s = reportSummary(f.id);
   if (s.count) return { basis: 'report', status: STATUS[s.latest.status], dataSource: 'USER_REPORT', at: s.latest.createdAt, summary: s };
   return { basis: 'none', status: null };
 }
 function floorStatus(f, floor) {
-  const fl = getFloorLive(f.id, floor.id);
-  if (fl) return { basis: 'live', status: statusOf(fl.available, fl.total), live: fl };
+  const live = getLive(f.id), fl = getFloorLive(f.id, floor.id);
+  if (fl && statusOf(fl.available, fl.total)) return { basis: 'live', status: statusOf(fl.available, fl.total), live: fl };
+  if (live && live.floors) { const s0 = reportSummary(f.id, floor.id); return { basis: 'nodata', status: s0.count ? STATUS[s0.latest.status] : null, summary: s0 }; }
   const s = reportSummary(f.id, floor.id);
   if (s.count) return { basis: 'report', status: STATUS[s.latest.status], summary: s };
   return { basis: 'none', status: null };
 }
-const isCrowded = st => !!st && (st.key === 'busy' || st.key === 'full');
-function dataFreshness(live) { return { stale: minutesSince(live.updatedAt) >= CONFIG.DATA_STALE_MIN || live.realtime === false }; }
+const isCrowded = st => !!st && ['busy', 'very', 'full'].includes(st.key);
+function dataFreshness(live) { if (live.dataSource === 'MOCK') return { stale: false }; return { stale: minutesSince(live.updatedAt) >= CONFIG.DATA_STALE_MIN || live.realtime === false }; }
 
 /* ---- 포맷 ---- */
 const fmt = n => Number(n).toLocaleString('ko-KR');
@@ -867,6 +1205,35 @@ function searchDestinations(q, limit = CONFIG.SEARCH_LIMIT) {
   return state.destinations.map(d => ({ d, s: scoreDestination(d, q) + (d.kind === 'destination' ? 5 : 0) }))
     .filter(x => x.s > 5).sort((a, b) => b.s - a.s || a.d.name.localeCompare(b.d.name, 'ko')).slice(0, limit).map(x => x.d);
 }
+/** PARKING SEARCH — 주차시설 이름으로도 검색 (목적지와 독립) */
+function searchFacilities(q, limit = CONFIG.SEARCH_LIMIT) {
+  const n = norm(q); if (!n) return [];
+  return state.facilities.filter(f => !f.external).map(f => {
+    const d = destinationOfFacility(f), name = norm(f.name);
+    if (d && d.kind === 'public_lot') return null; // 공영주차장은 목적지 결과로 이미 노출
+    const s = name === n ? 950 : name.startsWith(n) ? 750 : name.includes(n) ? 650 : (isChoOnly(q) && toCho(name).includes(n)) ? 450 : 0;
+    return s ? { f, s } : null;
+  }).filter(Boolean).sort((a, b) => b.s - a.s).slice(0, limit).map(x => x.f);
+}
+/** 외부 장소 결과 중 내부 목적지·주차장과 같은 곳(200m 이내 + 이름 유사)은 내부 것으로 합친다 */
+function dedupeExternal(places, internalDests, internalFacs) {
+  return places.filter(p => ![...internalDests.filter(x => x.kind !== 'external'), ...internalFacs.filter(x => !x.external)].some(x => hasCoords(x) && calculateDistance(x.lat, x.lng, p.lat, p.lng) <= 200 &&
+    (nameSimilar(x.name, p.name) || (x.aliases || []).some(a => nameSimilar(a, p.name)))));
+}
+/**
+ * 통합 검색: Destination 검색 + Parking Facility 검색을 독립적으로 수행 후 합침.
+ * 우선순위: 정확 일치 목적지 → 정확 일치 주차장 → 유사 목적지 → 유사 주차장 → 외부 장소
+ */
+function searchAll(q) {
+  const dests = searchDestinations(q, 10), facs = searchFacilities(q, 5);
+  const ext = state.search.q === q && state.search.external ? dedupeExternal(state.search.external.places, state.destinations, state.facilities) : [];
+  const extDest = ext.filter(p => p.kind !== 'parking'), extPark = ext.filter(p => p.kind === 'parking');
+  const exactD = dests.filter(d => scoreDestination(d, q) >= 900), exactF = facs.filter(f => norm(f.name) === norm(q));
+  const rest = [...dests.filter(d => !exactD.includes(d)).map(d => ({ type: 'dest', d })), ...facs.filter(f => !exactF.includes(f)).map(f => ({ type: 'fac', f }))];
+  const items = [...exactD.map(d => ({ type: 'dest', d })), ...exactF.map(f => ({ type: 'fac', f })), ...rest,
+    ...extDest.map(p => ({ type: 'place', p })), ...extPark.map(p => ({ type: 'placeParking', p }))];
+  return items.slice(0, 8);
+}
 function highlight(text, q) {
   const safe = esc(text);
   if (!q || isChoOnly(q)) return safe;
@@ -890,46 +1257,50 @@ function rememberDestination(id) { Store.data.recentDestinations = [id, ...Store
  * ===================================================================== */
 function evaluateGuide(dest, primary) {
   if (!dest || !dest.guide) return null;
+  const g = dest.guide;
   const pst = primary ? facilityStatus(primary) : { status: null };
   const primaryBusy = isCrowded(pst.status);
   const pLive = primary ? getLive(primary.id) : null;
-  const recs = (dest.guide.recommendations || []).map(rec => {
+  const recs = g.alternatives.map(rec => {
     const alt = getFacility(rec.parkingId);
     if (!alt || (primary && alt.id === primary.id)) return null;
-    const active = rec.condition === 'always' || (rec.condition === 'when_primary_busy' && primaryBusy);
+    const active = rec.recommendedWhen === 'always' || (rec.recommendedWhen === 'when_primary_busy' && primaryBusy);
     const aLive = getLive(alt.id);
     const reasons = [];
-    if (rec.connectionType === 'indoor') reasons.push({ icon: 'fa-link', text: '목적지 연결통로' });
-    if (rec.walkingTime != null && rec.walkingTime <= 5) reasons.push({ icon: 'fa-person-walking', text: `도보 약 ${rec.walkingTime}분` });
-    if (aLive) reasons.push({ icon: 'fa-square-parking', text: `현재 여유 좌석 ${fmt(aLive.available)}석` });
-    const moreRoom = !!(aLive && pLive && (aLive.available / aLive.total) > (pLive.available / pLive.total));
+    if (rec.connection === 'indoor') reasons.push({ icon: 'fa-link', text: '목적지 연결통로' });
+    if (rec.walkingMinutes != null && rec.walkingMinutes <= 5) reasons.push({ icon: 'fa-person-walking', text: `도보 약 ${rec.walkingMinutes}분` });
+    if (hasNumbers(aLive)) reasons.push({ icon: 'fa-square-parking', text: `현재 여유 좌석 ${fmt(aLive.available)}석` });
+    const moreRoom = !!(hasNumbers(aLive) && hasNumbers(pLive) && (aLive.available / aLive.total) > (pLive.available / pLive.total));
     if (moreRoom) reasons.push({ icon: 'fa-arrow-trend-down', text: `현재 ${primary.shortName}보다 여유` });
     if (rec.source === 'OFFICIAL') reasons.push({ icon: 'fa-building-circle-check', text: '공식 주차 안내 기반' });
     return { rec, alt, active, reasons, moreRoom, aLive };
   }).filter(Boolean);
-  return { dest, primary, primaryStatus: pst, primaryBusy, summary: dest.guide.summary, recs,
-    warnings: dest.guide.warnings || [], tips: dest.guide.tips || [], sources: dest.guide.sources || [] };
+  return { dest, primary, primaryStatus: pst, primaryBusy, verified: g.verified, verifiedAt: g.verifiedAt, summary: g.summary, recs,
+    warnings: g.warnings || [], tips: g.tips || [], sources: g.sources || [] };
 }
+const hasNumbers = l => !!(l && l.total != null && l.available != null);
 
 /**
- * 대체 주차장 후보 (등록된 데이터만)
- *   1) 같은 목적지의 다른 주차시설   2) 가이드 추천   3) 반경 500m 안의 등록 주차장
- * 정렬 규칙: 연결통로 → 실시간 여유석 있음 → 상태 좋음 → 가까움
+ * 대체 주차장 (실데이터·검증 정보만)
+ *   ① 검증 Guide 대안  ② 같은 목적지의 다른 공식 주차장  ③ 반경 500m 안의 "실시간 데이터가 있는" 등록 주차장
+ * 실시간 정보가 없는 외부(카카오) 주차장은 '주변 주차장' 섹션에서 따로 보여준다.
+ * 정렬: 연결 동선 → Guide 검증 → 실제 잔여석 있음 → 상태 → 데이터 최신성 → 거리  (없는 값은 비교에서 제외)
  */
 function getAlternatives(dest, primary) {
   const guide = evaluateGuide(dest, primary);
   const map = new Map();
   const add = (f, extra = {}) => {
     if (!f || (primary && f.id === primary.id)) return;
-    const cur = map.get(f.id) || { f, reasons: [], connection: false, sameDestination: false, guideRec: null };
+    const cur = map.get(f.id) || { f, connection: false, sameDestination: false, guideRec: null };
     Object.assign(cur, extra); map.set(f.id, cur);
   };
   facilitiesOf(dest).forEach(f => add(f, { sameDestination: true }));
-  if (guide) guide.recs.forEach(g => add(g.alt, { guideRec: g, connection: g.rec.connectionType === 'indoor' }));
+  if (guide) guide.recs.forEach(g => add(g.alt, { guideRec: g, connection: g.rec.connection === 'indoor' }));
   const origin = primary && hasCoords(primary) ? primary : dest;
   state.facilities.forEach(f => {
+    if (f.external && !f.liveRef) return;
     const d = distanceBetween(origin, f);
-    if (d != null && d <= CONFIG.ALT_RADIUS_M) add(f);
+    if (d != null && d <= CONFIG.ALT_RADIUS_M && hasNumbers(getLive(f.id))) add(f);
   });
   const pLive = primary ? getLive(primary.id) : null;
   return [...map.values()].map(c => {
@@ -939,15 +1310,40 @@ function getAlternatives(dest, primary) {
     if (!c.guideRec) {
       if (c.sameDestination) reasons.push({ icon: 'fa-building', text: `${dest.name} 주차시설` });
       if (d != null && d > 0 && walkMin(d) <= 5) reasons.push({ icon: 'fa-person-walking', text: `도보 약 ${walkMin(d)}분` });
-      if (live) reasons.push({ icon: 'fa-square-parking', text: `현재 여유 좌석 ${fmt(live.available)}석` });
-      if (live && pLive && live.available / live.total > pLive.available / pLive.total) reasons.push({ icon: 'fa-arrow-trend-down', text: '현재 더 여유' });
-      if (live && live.dataSource === 'PUBLIC_API') reasons.push({ icon: 'fa-building-columns', text: '공공데이터 실시간' });
+      if (hasNumbers(live)) reasons.push({ icon: 'fa-square-parking', text: `현재 여유 좌석 ${fmt(live.available)}석` });
+      if (hasNumbers(live) && hasNumbers(pLive) && live.available / live.total > pLive.available / pLive.total) reasons.push({ icon: 'fa-arrow-trend-down', text: '현재 더 여유' });
+      if (live && live.dataSource !== 'MOCK') reasons.push({ icon: DATA_SOURCE[live.dataSource].icon, text: DATA_SOURCE[live.dataSource].label });
     }
-    return { ...c, d, status: st, live, reasons };
-  }).filter(c => !(c.live && c.live.available <= 0))
-    .sort((a, b) => (b.connection - a.connection) || ((b.live ? 1 : 0) - (a.live ? 1 : 0))
+    return { ...c, d, status: st, live, reasons, verifiedGuide: !!(c.guideRec && guide && guide.verified) };
+  }).filter(c => !(hasNumbers(c.live) && c.live.available === 0))
+    .sort((a, b) => (b.connection - a.connection) || (b.verifiedGuide - a.verifiedGuide)
+      || ((hasNumbers(b.live) ? 1 : 0) - (hasNumbers(a.live) ? 1 : 0))
       || ((a.status.status ? STATUS_ORDER.indexOf(a.status.status.key) : 9) - (b.status.status ? STATUS_ORDER.indexOf(b.status.status.key) : 9))
+      || ((a.live && dataFreshness(a.live).stale ? 1 : 0) - (b.live && dataFreshness(b.live).stale ? 1 : 0))
       || ((a.d == null ? 1e9 : a.d) - (b.d == null ? 1e9 : b.d)));
+}
+
+/** 목적지 주변 실제 주차장 (카카오 PK6). 실시간 소스와 같은 주차장이면(40m 이내 + 이름 유사) liveRef 로 연결 */
+const nameSimilar = (a, b) => { const x = norm(a).replace(/주차장|공영|\(시\)|\(구\)/g, ''), y = norm(b).replace(/주차장|공영|\(시\)|\(구\)/g, ''); return !!x && !!y && (x.includes(y) || y.includes(x)); };
+async function loadNearbyParking(dest, radius = CONFIG.NEARBY_PARKING_RADIUS) {
+  if (!dest || !hasCoords(dest)) return;
+  state.nearby = { destId: dest.id, radius, status: 'loading', ids: [] };
+  try {
+    const places = await NearbyParkingAdapter.around(dest.lat, dest.lng, radius);
+    const ids = [];
+    places.forEach(p => {
+      let f = getFacility('pk-' + p.id);
+      if (!f) { f = facilityFromPlace(p); state.facilities.push(f); }
+      const live = state.facilities.find(x => !x.external && hasCoords(x) && hasNumbers(getLive(x.id)) && calculateDistance(x.lat, x.lng, p.lat, p.lng) <= 40 && nameSimilar(x.name, p.name));
+      f.liveRef = live ? live.id : null;
+      if (!facilitiesOf(dest).some(o => o.id === f.id || (o.id === f.liveRef))) ids.push(f.id);
+    });
+    if (state.nearby.destId === dest.id) state.nearby = { destId: dest.id, radius, status: 'ok', ids };
+    dest.nearbyParkingIds = ids;
+  } catch (e) {
+    console.warn('주변 주차장 로드 실패', e && e.message);
+    if (state.nearby.destId === dest.id) state.nearby = { destId: dest.id, radius, status: 'error', ids: [] };
+  }
 }
 
 
@@ -1063,13 +1459,15 @@ function statusPill(st, available = 1, extra = '') {
 const noLivePill = (text = '실시간 미연결', extra = '') => `<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-sub bg-card2 border border-line rounded-full px-2 py-0.5 ${extra}">⚪ ${text}</span>`;
 function sourceTag(dataSource, extra = '') {
   const s = DATA_SOURCE[dataSource]; if (!s) return '';
-  const cls = dataSource === 'MOCK' ? 'text-sub border border-dashed border-line' : dataSource === 'OFFICIAL' ? 'st-free bg-emerald-500/10' : dataSource === 'PUBLIC_API' ? 'text-brand bg-brand/10' : 'text-sub bg-card2';
-  return `<span class="inline-flex items-center gap-1 text-[10.5px] font-bold rounded-full px-2 py-0.5 ${cls} ${extra}"><i class="fa-solid ${s.icon}" aria-hidden="true"></i>${s.label}</span>`;
+  const label = dataSource === 'OFFICIAL' ? '공식 주차 안내 기반' : s.label;
+  const cls = dataSource === 'MOCK' ? 'text-sub border border-dashed border-line' : dataSource === 'OFFICIAL' ? 'st-free bg-emerald-500/10' : dataSource === 'USER_REPORT' ? 'text-sub bg-card2' : 'text-brand bg-brand/10';
+  return `<span class="inline-flex items-center gap-1 text-[10.5px] font-bold rounded-full px-2 py-0.5 ${cls} ${extra}"><i class="fa-solid ${s.icon}" aria-hidden="true"></i>${label}</span>`;
 }
 function liveSourceLine(live) {
-  if (live.dataSource === 'MOCK') return `<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-sub border border-dashed border-line rounded-full px-2 py-0.5"><i class="fa-solid fa-flask" aria-hidden="true"></i>프로토타입 데이터 · 실제 현황 아님</span>`;
-  if (dataFreshness(live).stale) return `<span class="inline-flex items-center gap-1 text-[11px] font-bold st-busy rounded-full px-2 py-0.5" style="background:#f973161f"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>데이터 업데이트 지연 · <span data-ago="${live.updatedAt}">${timeAgo(live.updatedAt)}</span></span>`;
-  return `<span class="inline-flex items-center gap-1 text-[11px] font-bold text-brand bg-brand/10 rounded-full px-2 py-0.5"><i class="fa-solid fa-building-columns" aria-hidden="true"></i>공공데이터 기반 · <span data-ago="${live.updatedAt}">${timeAgo(live.updatedAt)}</span></span>`;
+  const s = DATA_SOURCE[live.dataSource] || DATA_SOURCE.MOCK;
+  if (live.dataSource === 'MOCK') return `<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-sub border border-dashed border-line rounded-full px-2 py-0.5">⚪ 프로토타입 데이터 · 실제 현황 아님</span>`;
+  if (dataFreshness(live).stale) return `<span class="inline-flex items-center gap-1 text-[11px] font-bold st-normal rounded-full px-2 py-0.5" style="background:#eab3081f">🟡 마지막 업데이트 <span data-ago="${live.updatedAt}">${timeAgo(live.updatedAt)}</span> · ${esc(s.short)}</span>${live.provider ? `<span class="text-[10.5px] text-sub">${esc(live.provider)}</span>` : ''}`;
+  return `<span class="inline-flex items-center gap-1 text-[11px] font-bold text-brand bg-brand/10 rounded-full px-2 py-0.5">${s.dot} ${s.label} · <span data-ago="${live.updatedAt}">${timeAgo(live.updatedAt)}</span></span>${live.provider ? `<span class="text-[10.5px] text-sub">${esc(live.provider)}</span>` : ''}`;
 }
 function refLink(refKey) {
   const r = REFERENCES[refKey]; if (!r) return '';
@@ -1142,7 +1540,7 @@ function closeReward() { $('#reward').classList.add('hidden'); $('#reward').clas
 /* ---- 12-4. 즐겨찾기 바로가기 ---- */
 function destLiveSummary(d) {
   const fs = facilitiesOf(d);
-  const lives = fs.map(f => getLive(f.id)).filter(Boolean);
+  const lives = fs.map(f => getLive(f.id)).filter(l => l && l.total != null);
   if (!lives.length) return null;
   const total = lives.reduce((s, l) => s + l.total, 0), available = lives.reduce((s, l) => s + l.available, 0);
   return { total, available, status: statusOf(available, total), mock: lives.some(l => l.dataSource === 'MOCK') };
@@ -1170,13 +1568,15 @@ function errorCardHTML(msg) {
     <button data-act="retry-load" class="press mt-4 h-11 px-5 rounded-full bg-brand text-white text-[13.5px] font-bold">다시 시도</button></div>`;
 }
 function sourceErrorBanner() {
-  if (state.sources.PUBLIC_API !== 'error') return '';
+  const failed = CONFIG.LIVE_SOURCES.filter(s => state.sources[s] === 'error' && !(PARKING_DATA_SOURCES[s] || {}).optional);
+  if (!failed.length) return '';
+  const last = Math.max(0, ...failed.map(s => state.sourceCheckedAt[s] || 0));
   return `<div class="rounded-2xl p-3 flex items-center gap-3 bg-card border border-line" role="alert"><i class="fa-solid fa-circle-exclamation st-full" aria-hidden="true"></i>
-    <p class="flex-1 text-[12.5px]">주차장 정보를 불러오지 못했습니다. (서울시 공공데이터)</p>
+    <p class="flex-1 text-[12.5px]">실시간 주차 데이터를 불러오지 못했습니다. (${failed.map(s => PARKING_DATA_SOURCES[s].label).join(', ')})<br/><span class="text-sub">마지막 확인: ${last ? new Date(last).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) : '없음'}</span></p>
     <button data-act="retry-load" class="press h-11 px-3.5 rounded-full bg-card2 border border-line text-[12.5px] font-bold">다시 시도</button></div>`;
 }
 function demoBanner() {
-  if (!Store.data.settings.demo) return '';
+  if (!DEV_MODE || !Store.data.settings.demo) return '';
   return `<div class="rounded-2xl px-3 py-2.5 flex items-center gap-2.5 border border-dashed border-line text-[12px] text-sub"><i class="fa-solid fa-flask" aria-hidden="true"></i>
     <span class="flex-1">데모 모드: 일부 주차장에 <b class="text-ink">가상 수치</b>가 표시돼요. 실제 현황이 아닙니다.</span>
     <button data-act="toggle-demo" class="h-9 px-2 font-bold text-brand">끄기</button></div>`;
@@ -1191,6 +1591,7 @@ function destinationHeaderHTML(d, fs, cur) {
         <div class="flex flex-wrap items-center gap-1.5 mb-2">${categoryBadge(d)}${d.guide ? '<span class="inline-flex items-center gap-1 text-[11px] font-bold text-brand bg-brand/10 px-2 py-0.5 rounded-full"><i class="fa-solid fa-lightbulb" aria-hidden="true"></i>주차 가이드</span>' : ''}</div>
         <h2 class="text-[22px] font-extrabold leading-tight tracking-tight">${esc(d.name)}</h2>
         <p class="text-[12.5px] text-sub mt-1 truncate"><i class="fa-solid fa-location-dot mr-1" aria-hidden="true"></i>${esc(d.address)}</p>
+        ${d.kind === 'external' ? `<p class="text-[11.5px] text-sub mt-1">📍 목적지 · ${esc(d.placeCategory || '')}${d.url ? ` · <a href="${esc(d.url)}" target="_blank" rel="noopener" class="underline decoration-dotted">${d.provider === 'tmap' ? 'TMAP' : '카카오맵'} 장소 정보</a>` : ''}</p>` : ''}
       </div>
       <button data-act="fav" data-id="${d.id}" aria-pressed="${fav}" aria-label="${fav ? '즐겨찾기에서 빼기' : '즐겨찾기에 추가'}" class="press w-11 h-11 rounded-full bg-card2 border border-line grid place-items-center shrink-0">
         <i class="fa-${fav ? 'solid' : 'regular'} fa-star ${fav ? 'text-amber-400' : 'text-sub'}" aria-hidden="true"></i></button>
@@ -1216,8 +1617,21 @@ function warningHTML(f, st, alts) {
   </div>`;
 }
 
+function capabilityPanelHTML(f) {
+  const c = dataCapability(f), d = destinationOfFacility(f);
+  const rows = [
+    ['실시간 데이터', c.realtime], ['층별 데이터', c.floorLevel], ['잔여면', c.availableSpaces], ['전체 주차면', c.totalSpaces],
+    ['업데이트 시간', c.updatedAt], ['요금 정보', !!f.fee], ['공식 층 구조', c.floorStructure], ['검증 주차 가이드', !!(d && d.guide && d.guide.verified)], ['현장 제보', true],
+  ];
+  return `<details class="mt-3 group"><summary class="cursor-pointer list-none min-h-[40px] flex items-center gap-1.5 text-[12px] font-bold text-sub">
+      <i class="fa-solid fa-list-check" aria-hidden="true"></i>이 주차장의 데이터 제공 현황<i class="fa-solid fa-chevron-down text-[10px] ml-auto group-open:rotate-180 transition" aria-hidden="true"></i></summary>
+    <ul class="grid grid-cols-2 gap-x-3 gap-y-1.5 mt-1 text-[12px]">${rows.map(([k, v]) => `<li class="flex items-center gap-1.5"><i class="fa-solid ${v ? 'fa-circle-check st-free' : 'fa-circle-minus text-sub'}" aria-hidden="true"></i><span class="${v ? '' : 'text-sub'}">${k} ${v ? '' : '<span class="sr-only">없음</span>'}</span></li>`).join('')}</ul>
+  </details>`;
+}
+
 function facilityCardHTML(d, f) {
-  const fst = facilityStatus(f), live = fst.basis === 'live' ? fst.live : null;
+  const fst = facilityStatus(f), live = getLive(f.id), cap = dataCapability(f);
+  const hasNums = !!(live && live.total != null);
   const fr = floorRangeText(f);
   const infoBits = [];
   if (fr) infoBits.push(`🅿️ 주차 ${fr}`);
@@ -1227,8 +1641,34 @@ function facilityCardHTML(d, f) {
   if (f.hours) extras.push(['운영', f.hours]);
   if (f.tel) extras.push(['문의', f.tel]);
   const extrasShown = extras.filter(x => x[1]);
-  const slabs = live && live.floors ? f.floors.filter(fl => live.floors[fl.id]).map(fl => { const x = live.floors[fl.id], s = statusOf(x.available, x.total);
-    return `<div class="slab"><i style="width:${Math.max(occPct(x.total, x.available), 24)}%;background:${s.color}"></i><b>${esc(fl.id)}</b><em class="tnum">${x.available}</em></div>`; }).join('') : '';
+  const floorsLive = live && live.floors ? displayFloors(f).filter(fl => live.floors[fl.id]) : [];
+  const slabs = floorsLive.map(fl => { const x = live.floors[fl.id], s = statusOf(x.available, x.total);
+    return `<div class="slab"><i style="width:${Math.max(occPct(x.total, x.available), 24)}%;background:${s.color}"></i><b>${esc(fl.id)}</b><em class="tnum">${x.available}</em></div>`; }).join('');
+
+  let body;
+  if (hasNums) {
+    body = `
+      <div class="mt-4 flex items-end gap-4">
+        <div class="flex-1 min-w-0">
+          <p class="text-[12px] text-sub font-semibold">${cap.caseType === 'A' ? '실시간 주차 현황 · 층별 합계' : '실시간 잔여석'}</p>
+          <p class="leading-none mt-1.5 whitespace-nowrap"><span class="text-[46px] font-black tnum tracking-tighter st-${fst.status.key}">${fmt(live.available)}</span><span class="text-[15px] text-sub font-bold ml-1">/ ${fmt(live.total)}대</span></p>
+          <p class="text-[12.5px] text-sub mt-2">현재 총 <b class="text-ink tnum">${fmt(live.available)}대</b> 여유 · 점유율 <b class="text-ink tnum">${occPct(live.total, live.available)}%</b></p>
+        </div>
+        ${slabs ? `<div class="w-[42%] max-w-[170px]"><div class="tower" aria-hidden="true">${slabs}</div></div>` : ''}
+      </div>
+      <div class="mt-3 flex flex-wrap items-center gap-1.5">${liveSourceLine(live)}${cap.caseType === 'B' ? '<span class="text-[11px] text-sub">층별 데이터 없음 · 전체 잔여석만 제공</span>' : ''}</div>`;
+  } else if (live && live.availabilityFlag) {
+    body = `<div class="mt-4 rounded-2xl bg-card2 border border-line p-4"><p class="font-bold text-[15px]">${statusPill(fst.status)}</p>
+      <p class="text-[12.5px] text-sub mt-2">이 데이터는 주차 가능 여부만 제공해요. 잔여석 숫자는 제공되지 않아요.</p><div class="mt-2">${liveSourceLine(live)}</div></div>`;
+  } else {
+    body = `
+      <div class="mt-4 rounded-2xl bg-card2 border border-line p-4">
+        <p class="font-bold text-[14.5px]">⚪ 실시간 잔여석 데이터가 없습니다</p>
+        <p class="text-[12.5px] text-sub mt-1 leading-snug">이 주차장은 실시간 데이터가 연결되지 않았어요. 숫자를 추정해서 보여드리지 않습니다.</p>
+        ${fst.basis === 'report' ? `<p class="mt-2.5 text-[12.5px] flex flex-wrap items-center gap-1.5"><span class="font-bold">🔵 현장 제보</span>${statusPill(fst.status)}<span class="text-sub"><span data-ago="${fst.at}">${timeAgo(fst.at)}</span> · ${fst.summary.text}</span></p>` : ''}
+        ${DEV_MODE && !Store.data.settings.demo && DEMO_AVAILABILITY[f.id] ? '<button data-act="toggle-demo" class="mt-2 h-9 text-[12px] font-bold text-brand">데모 수치로 기능 미리보기</button>' : ''}
+      </div>`;
+  }
 
   return `
   <section class="card overflow-hidden" aria-label="${esc(f.name)} 현황">
@@ -1236,26 +1676,12 @@ function facilityCardHTML(d, f) {
       <div class="flex items-start justify-between gap-3">
         <div class="min-w-0"><p class="text-[12px] text-sub font-semibold">주차시설</p><h3 class="text-[17px] font-extrabold leading-tight mt-0.5">${esc(f.name)}</h3>
           <p class="text-[12px] text-sub mt-1">${infoBits.length ? infoBits.join(' · ') : '층·규모 정보 미등록'}</p></div>
-        ${fst.status ? statusPill(fst.status, live ? live.available : 1, 'shrink-0') : noLivePill('상태 미확인', 'shrink-0')}
+        ${fst.status ? statusPill(fst.status, hasNums ? live.available : 1, 'shrink-0') : noLivePill('상태 미확인', 'shrink-0')}
       </div>
-      ${live ? `
-        <div class="mt-4 flex items-end gap-4">
-          <div class="flex-1 min-w-0">
-            <p class="text-[12px] text-sub font-semibold">잔여석</p>
-            <p class="leading-none mt-1.5 whitespace-nowrap"><span class="text-[46px] font-black tnum tracking-tighter st-${fst.status.key}">${fmt(live.available)}</span><span class="text-[15px] text-sub font-bold ml-1">/ ${fmt(live.total)}석</span></p>
-            <p class="text-[12.5px] text-sub mt-2">점유율 <b class="text-ink tnum">${occPct(live.total, live.available)}%</b></p>
-          </div>
-          ${slabs ? `<div class="w-[42%] max-w-[170px]"><div class="tower" aria-hidden="true">${slabs}</div></div>` : ''}
-        </div>
-        <div class="mt-3">${liveSourceLine(live)}</div>`
-      : `
-        <div class="mt-4 rounded-2xl bg-card2 border border-line p-4">
-          <p class="font-bold text-[14.5px]">⚪ 실시간 잔여석 데이터가 없습니다</p>
-          <p class="text-[12.5px] text-sub mt-1 leading-snug">이 주차장은 실시간 잔여석 데이터가 연결되지 않았어요. 숫자를 추정해서 보여드리지 않습니다.</p>
-          ${fst.basis === 'report' ? `<p class="mt-2.5 text-[12.5px] flex flex-wrap items-center gap-1.5"><i class="fa-solid fa-user-check text-sub" aria-hidden="true"></i>현장 제보 기반: ${statusPill(fst.status)}<span class="text-sub"><span data-ago="${fst.at}">${timeAgo(fst.at)}</span> · ${fst.summary.text}</span></p>` : ''}
-          ${!Store.data.settings.demo && DEMO_AVAILABILITY[f.id] ? '<button data-act="toggle-demo" class="mt-2 h-9 text-[12px] font-bold text-brand">데모 수치로 기능 미리보기</button>' : ''}
-        </div>`}
-      ${f.info && f.info.dataSource === 'OFFICIAL' ? `<p class="mt-3 text-[11.5px] text-sub"><i class="fa-solid fa-building-circle-check mr-1 st-free" aria-hidden="true"></i>층·규모: 공식 주차 안내 기반 · ${refLink(f.info.ref)}</p>` : ''}
+      ${body}
+      ${f.info && f.info.dataSource === 'OFFICIAL' ? `<p class="mt-3 text-[11.5px] text-sub">⚪ 시설 정보 · ${refLink(f.info.ref)}</p>` : ''}
+      ${f.external ? `<p class="mt-3 text-[11.5px] text-sub">⚪ 시설 정보 · ${esc(f.info.provider)}${f.address ? ` · ${esc(f.address)}` : ''}</p>` : ''}
+      ${capabilityPanelHTML(f)}
     </div>
     ${extrasShown.length ? `<div class="grid border-t border-line divide-x divide-line text-center" style="grid-template-columns:repeat(${extrasShown.length},minmax(0,1fr))">
       ${extrasShown.map(([k, v]) => `<div class="py-3 px-1"><p class="text-[11px] text-sub">${k}</p><p class="text-[13.5px] font-bold mt-0.5 tnum truncate">${esc(v)}</p></div>`).join('')}</div>` : ''}
@@ -1268,28 +1694,32 @@ function facilityCardHTML(d, f) {
 
 function guideCardHTML(d, f) {
   const g = evaluateGuide(d, f);
-  if (!g) return `<section class="card p-4 flex items-center gap-3" aria-label="주차 가이드"><i class="fa-regular fa-lightbulb text-sub text-lg" aria-hidden="true"></i><p class="text-[13px] text-sub">등록된 주차 가이드가 없습니다.</p></section>`;
+  if (!g) return `<section class="card p-4 flex items-center gap-3" aria-label="Parking Guide"><i class="fa-regular fa-lightbulb text-sub text-lg" aria-hidden="true"></i><p class="text-[13px] text-sub">등록된 주차 가이드가 없습니다.</p></section>`;
   const activeRecs = g.recs.filter(r => r.active), idleRecs = g.recs.filter(r => !r.active);
+  const badge = g.verified
+    ? `<span class="inline-flex items-center gap-1 text-[10.5px] font-bold st-free bg-emerald-500/10 rounded-full px-2 py-0.5"><i class="fa-solid fa-circle-check" aria-hidden="true"></i>ParkingView 검증 가이드 · ${esc(g.verifiedAt)} 확인</span>`
+    : `<span class="inline-flex items-center gap-1 text-[10.5px] font-bold st-busy rounded-full px-2 py-0.5" style="background:#f973161f"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>정보 확인 필요 · 미검증</span>`;
   const recHTML = (r, highlight) => `
     <div class="rounded-2xl p-3.5 ${highlight ? 'bg-brand/10 border-2 border-brand/30' : 'bg-card2 border border-line'}">
-      <p class="font-extrabold text-[14.5px]">🚗 ${esc(r.alt.shortName)}${r.rec.recommendedFloor ? ` <span class="text-brand">${esc(r.rec.recommendedFloor)}</span>` : ''}</p>
+      <p class="font-extrabold text-[14.5px]">🚗 ${esc(r.alt.shortName)}${r.rec.recommendedFloor ? ` <span class="text-brand">${esc(r.rec.recommendedFloor)}</span>` : ''}
+        ${r.aLive && r.aLive.total != null ? statusPill(facilityStatus(r.alt).status, r.aLive.available, 'ml-1 align-middle') : ''}</p>
       <div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-sub">
-        ${r.rec.walkingTime != null ? `<span>🚶 도보 약 ${r.rec.walkingTime}분</span>` : ''}
         ${r.rec.walkingDistance != null ? `<span>📏 약 ${fmt(r.rec.walkingDistance)}m</span>` : ''}
-        ${r.rec.connectionType === 'indoor' ? '<span>🔗 목적지 연결통로</span>' : ''}
+        ${r.rec.walkingMinutes != null ? `<span>🚶 도보 약 ${r.rec.walkingMinutes}분</span>` : ''}
+        ${r.rec.connection === 'indoor' ? '<span>🔗 목적지 연결통로</span>' : ''}
       </div>
       ${r.rec.reason ? `<p class="mt-1.5 text-[12.5px]">${esc(r.rec.reason)}</p>` : ''}
-      ${r.reasons.length ? `<p class="mt-2 text-[11.5px] font-bold text-sub">추천 이유</p><ul class="mt-1 space-y-0.5">${r.reasons.map(x => `<li class="text-[12.5px] flex items-center gap-1.5"><i class="fa-solid fa-check st-free text-[11px]" aria-hidden="true"></i>${esc(x.text)}</li>`).join('')}</ul>` : ''}
+      ${r.reasons.length ? `<p class="mt-2 text-[11.5px] font-bold text-sub">${g.verified ? 'ParkingView 추천 이유' : '안내 근거'}</p><ul class="mt-1 space-y-0.5">${r.reasons.map(x => `<li class="text-[12.5px] flex items-center gap-1.5"><i class="fa-solid fa-check st-free text-[11px]" aria-hidden="true"></i>${esc(x.text)}</li>`).join('')}</ul>` : ''}
       <div class="mt-3 grid grid-cols-2 gap-2">
         <button data-act="nav" data-id="${r.alt.id}" class="press h-11 rounded-xl bg-brand text-white text-[13px] font-bold"><i class="fa-solid fa-route mr-1" aria-hidden="true"></i>길안내</button>
         <button data-act="facility" data-id="${r.alt.id}" class="press h-11 rounded-xl bg-card border border-line text-[13px] font-bold">층별 보기</button>
       </div>
     </div>`;
   return `
-  <section class="card p-4" aria-label="주차 가이드">
-    <div class="flex items-center gap-2"><span class="w-8 h-8 rounded-xl bg-amber-400/20 grid place-items-center" aria-hidden="true">💡</span><h3 class="font-extrabold text-[16px]">ParkingView 주차 가이드</h3></div>
+  <section id="guide" class="card p-4 scroll-mt-4" aria-label="Parking Guide">
+    <div class="flex flex-wrap items-center gap-2"><span class="w-8 h-8 rounded-xl bg-amber-400/20 grid place-items-center" aria-hidden="true">💡</span><h3 class="font-extrabold text-[16px]">ParkingView Guide</h3>${badge}</div>
     <p class="mt-2 text-[13.5px] leading-snug">${esc(g.summary)}</p>
-    ${activeRecs.length ? `<p class="mt-3 text-[12.5px] font-bold st-busy"><i class="fa-solid fa-triangle-exclamation mr-1" aria-hidden="true"></i>현재 ${esc(f.shortName)} 주차장이 ${g.primaryStatus.status.label} 상태예요. 아래 주차장을 고려해보세요.</p>
+    ${activeRecs.length ? `<p class="mt-3 text-[12.5px] font-bold st-busy"><i class="fa-solid fa-triangle-exclamation mr-1" aria-hidden="true"></i>현재 ${esc(f.shortName)} 주차장이 ${g.primaryStatus.status.label} 상태예요. ${g.verified ? '아래 주차장을 고려해보세요.' : '아래 안내를 참고하되, 현장 상황을 확인하세요.'}</p>
       <div class="mt-2 space-y-2">${activeRecs.map(r => recHTML(r, true)).join('')}</div>` : ''}
     ${idleRecs.length ? `<p class="mt-3 text-[12px] font-bold text-sub">${g.primaryStatus.status ? `지금은 ${esc(f.shortName)} 상태가 ${g.primaryStatus.status.label}이에요. 혼잡할 때 대안:` : `${esc(f.shortName)} 주차장이 혼잡할 때 대안:`}</p>
       <div class="mt-2 space-y-2">${idleRecs.map(r => recHTML(r, false)).join('')}</div>` : ''}
@@ -1312,7 +1742,7 @@ function floorCardHTML(f, floor, bestId) {
     return `
     <article class="card p-4 ${isBest ? 'ring-2 ring-emerald-500/40' : ''}" aria-label="${esc(floor.id)} 잔여 ${x.available} / ${x.total}석, ${statusLabel(st, x.available)}">
       <div class="flex items-center gap-3">${badge}
-        <div class="flex-1 min-w-0"><div class="flex items-center gap-1.5 flex-wrap"><h4 class="font-bold text-[15.5px]">${esc(floor.id)} · ${esc(floor.name)}</h4>${isBest ? '<span class="text-[10.5px] font-bold st-free bg-emerald-500/10 px-1.5 py-0.5 rounded-md">가장 여유</span>' : ''}</div>
+        <div class="flex-1 min-w-0"><div class="flex items-center gap-1.5 flex-wrap"><h4 class="font-bold text-[15.5px]">${esc(floor.id === floor.name ? floor.id : floor.id + ' · ' + floor.name)}</h4>${isBest ? '<span class="text-[10.5px] font-bold st-free bg-emerald-500/10 px-1.5 py-0.5 rounded-md">가장 여유</span>' : ''}</div>
           <p class="text-[12px] mt-0.5 flex items-center gap-1.5">${statusPill(st, x.available, '!text-[11px]')}<span class="text-sub">점유율 <b class="text-ink tnum">${occ}%</b></span></p></div>
         <div class="text-right shrink-0"><p class="leading-none whitespace-nowrap"><span class="text-[28px] font-black tnum st-${st.key}">${fmt(x.available)}</span><span class="text-[13px] text-sub font-semibold"> / ${fmt(x.total)}</span></p><p class="text-[10.5px] text-sub mt-1">잔여 / 전체</p></div>
       </div>
@@ -1320,15 +1750,16 @@ function floorCardHTML(f, floor, bestId) {
       ${tip}
       <div class="mt-3 pt-2.5 border-t border-line flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11.5px]">
         <span class="flex flex-wrap items-center gap-1"><i class="fa-solid fa-user-check text-sub" aria-hidden="true"></i>${repLine}</span>
-        <span class="text-sub">${live.dataSource === 'MOCK' ? '프로토타입 데이터' : '공공데이터'} · 업데이트 <span data-ago="${updatedAt}">${timeAgo(updatedAt)}</span></span>
+        <span class="text-sub">${(DATA_SOURCE[live.dataSource] || DATA_SOURCE.MOCK).dot} ${live.dataSource === 'MOCK' ? '프로토타입 데이터' : (DATA_SOURCE[live.dataSource] || {}).short} · 업데이트 <span data-ago="${updatedAt}">${timeAgo(updatedAt)}</span></span>
       </div>
     </article>`;
   }
+  const noDataText = fs.basis === 'nodata' ? '데이터 없음 · 이 층은 실시간 데이터가 제공되지 않아요' : '실시간 잔여석 확인 불가';
   return `
-  <article class="card p-4" aria-label="${esc(floor.id)} 실시간 잔여석 확인 불가">
+  <article class="card p-4" aria-label="${esc(floor.id)} ${noDataText}">
     <div class="flex items-center gap-3">${badge}
-      <div class="flex-1 min-w-0"><h4 class="font-bold text-[15.5px]">${esc(floor.id)} · ${esc(floor.name)}</h4>
-        <p class="text-[12px] text-sub mt-0.5">실시간 잔여석 확인 불가</p></div>
+      <div class="flex-1 min-w-0"><h4 class="font-bold text-[15.5px]">${esc(floor.id === floor.name ? floor.id : floor.id + ' · ' + floor.name)}</h4>
+        <p class="text-[12px] text-sub mt-0.5">${noDataText}</p></div>
       ${st ? `<div class="text-right shrink-0"><p class="text-[10.5px] text-sub mb-1">현장 제보</p>${statusPill(st)}</div>` : ''}
     </div>
     ${tip}
@@ -1340,25 +1771,27 @@ function floorCardHTML(f, floor, bestId) {
 }
 
 function altCardHTML(c, idx) {
-  const f = c.f, dest = destinationOfFacility(f), st = c.status.status;
+  const f = c.f, dest = destinationOfFacility(f), st = c.status.status, nums = hasNumbers(c.live);
   return `
-  <article class="card p-4 ${idx === 0 ? 'ring-2 ring-brand/30' : ''}" aria-label="${esc(f.name)}">
+  <article class="card p-4 ${idx === 0 && c.verifiedGuide ? 'ring-2 ring-brand/30' : ''}" aria-label="${esc(f.name)}">
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-1.5 mb-1.5">
+          ${c.verifiedGuide ? '<span class="text-[10.5px] font-bold px-1.5 py-0.5 rounded-md bg-brand/10 text-brand">ParkingView 추천</span>' : c.guideRec ? '<span class="text-[10.5px] font-bold px-1.5 py-0.5 rounded-md bg-card2 border border-line text-sub">가이드 안내(미검증)</span>' : ''}
           ${c.connection ? '<span class="text-[10.5px] font-bold px-1.5 py-0.5 rounded-md bg-brand/10 text-brand">🔗 연결통로</span>' : ''}
-          ${c.live ? sourceTag(c.live.dataSource) : ''}
+          ${nums ? sourceTag(c.live.dataSource) : ''}
         </div>
         <h4 class="font-bold text-[15.5px] truncate">${esc(f.name)}</h4>
         <p class="text-[12.5px] text-sub mt-1">${c.d != null ? `<i class="fa-solid fa-person-walking mr-1" aria-hidden="true"></i><b class="text-ink tnum">${fmtDist(c.d)}</b> · 도보 약 ${walkMin(c.d)}분` : dest && dest.id !== state.selectedDestId ? esc(dest.name) : '거리 정보 미등록'}</p>
       </div>
       <div class="text-right shrink-0">
-        ${c.live ? `<p class="leading-none"><span class="text-[24px] font-black tnum st-${st.key}">${fmt(c.live.available)}</span><span class="text-[12px] text-sub font-semibold"> / ${fmt(c.live.total)}</span></p><p class="mt-1.5">${statusPill(st, c.live.available, '!text-[10.5px]')}</p>`
-          : st ? `<p class="text-[10.5px] text-sub mb-1">현장 제보</p>${statusPill(st)}` : noLivePill()}
+        ${nums ? `<p class="leading-none"><span class="text-[24px] font-black tnum st-${st.key}">${fmt(c.live.available)}</span><span class="text-[12px] text-sub font-semibold"> / ${fmt(c.live.total)}</span></p><p class="mt-1.5">${statusPill(st, c.live.available, '!text-[10.5px]')}</p>`
+          : st ? `<p class="text-[10.5px] text-sub mb-1">${c.status.basis === 'report' ? '🔵 현장 제보' : ''}</p>${statusPill(st)}` : noLivePill()}
       </div>
     </div>
-    ${f.fee ? `<p class="mt-2 text-[12.5px] text-sub">요금: <b class="text-ink">${f.fee.free ? '무료' : f.fee.hourly ? `1시간 ${fmt(f.fee.hourly)}원` : '정보 없음'}</b></p>` : ''}
-    ${c.guideRec && c.guideRec.rec.recommendedFloor ? `<p class="mt-1 text-[12.5px]">추천 층: <b class="text-brand">${esc(c.guideRec.rec.recommendedFloor)}</b></p>` : ''}
+    ${f.fee ? `<p class="mt-2 text-[12.5px] text-sub">요금: <b class="text-ink">${f.fee.free ? '무료' : f.fee.per10min ? `10분당 ${fmt(f.fee.per10min)}원` : f.fee.hourly ? `1시간 ${fmt(f.fee.hourly)}원` : '정보 없음'}</b></p>` : ''}
+    ${f.hours ? `<p class="text-[12.5px] text-sub">운영: <b class="text-ink">${esc(f.hours)}</b></p>` : ''}
+    ${c.guideRec && c.guideRec.rec.recommendedFloor ? `<p class="mt-1 text-[12.5px]">안내 층: <b class="text-brand">${esc(c.guideRec.rec.recommendedFloor)}</b></p>` : ''}
     ${c.reasons.length ? `<ul class="mt-2 flex flex-wrap gap-x-3 gap-y-1">${c.reasons.map(x => `<li class="text-[12px] flex items-center gap-1"><i class="fa-solid fa-check st-free text-[10px]" aria-hidden="true"></i>${esc(x.text)}</li>`).join('')}</ul>` : ''}
     <div class="mt-3 grid grid-cols-2 gap-2">
       <button data-act="nav" data-id="${f.id}" class="press h-11 rounded-xl bg-brand text-white text-[13.5px] font-bold" aria-label="${esc(f.name)} 길안내"><i class="fa-solid fa-route mr-1.5" aria-hidden="true"></i>길안내</button>
@@ -1367,87 +1800,155 @@ function altCardHTML(c, idx) {
   </article>`;
 }
 
+/** 주변 실제 주차장 (카카오 PK6, 정적 시설 정보) — "ParkingView 추천"이 아님 */
+function nearbyParkingSectionHTML(dest) {
+  const nb = state.nearby.destId === dest.id ? state.nearby : { status: 'idle', ids: [], radius: CONFIG.NEARBY_PARKING_RADIUS };
+  const head = `<div class="flex items-end justify-between mb-2.5 px-1"><div><h3 class="text-[17px] font-extrabold">주변 주차장</h3>
+      <p class="text-[12px] text-sub mt-0.5">목적지 반경 ${fmtDist(nb.radius || CONFIG.NEARBY_PARKING_RADIUS)} · ⚪ 시설 정보 (카카오 장소)</p></div>${nb.status === 'ok' ? `<span class="text-[12px] font-bold text-brand">${nb.ids.length}곳</span>` : ''}</div>`;
+  let body;
+  if (!hasCoords(dest)) body = '<div class="card p-5 text-[13px] text-sub">목적지 좌표가 없어 주변 주차장을 찾을 수 없어요.</div>';
+  else if (nb.status === 'loading' || nb.status === 'idle') body = `<div class="card p-3.5 flex items-center gap-3" aria-busy="true"><div class="skel w-11 h-11 !rounded-2xl"></div><div class="flex-1 space-y-2"><div class="skel h-4 w-2/3"></div><div class="skel h-3 w-1/3"></div></div></div>`;
+  else if (nb.status === 'error') body = `<div class="card p-5 text-center" role="alert"><p class="text-[13.5px] font-semibold">주변 주차장 정보를 불러오지 못했습니다.</p><button data-act="nearby-retry" class="press mt-3 h-11 px-4 rounded-full bg-card2 border border-line text-[13px] font-bold">다시 시도</button></div>`;
+  else if (!nb.ids.length) body = `<div class="card p-5 text-center"><p class="text-[13.5px] font-semibold">주변 ${fmtDist(nb.radius)} 안에 등록된 주차장이 없습니다.</p>
+      ${nb.radius < CONFIG.NEARBY_PARKING_RADIUS_MAX ? `<button data-act="nearby-expand" class="press mt-3 h-11 px-4 rounded-full bg-card2 border border-line text-[13px] font-bold">반경 ${fmtDist(CONFIG.NEARBY_PARKING_RADIUS_MAX)}로 넓히기</button>` : ''}</div>`;
+  else body = `<div class="card divide-y divide-line overflow-hidden">${nb.ids.map(getFacility).filter(Boolean).map(f => {
+      const d = distanceBetween(dest, f), live = getLive(f.id), st = facilityStatus(f).status;
+      return `<div class="flex items-center gap-3 px-4 py-3">
+        <div class="w-10 h-10 rounded-xl grid place-items-center shrink-0 ${st ? 'st-' + st.key : 'bg-card2 text-sub'}" style="${st ? `background:${st.color}1c` : ''}" aria-hidden="true"><i class="fa-solid fa-square-parking"></i></div>
+        <button data-act="facility" data-id="${f.id}" class="flex-1 min-w-0 text-left min-h-[44px]"><p class="text-[14px] font-semibold truncate">${esc(f.name)}</p>
+          <p class="text-[11.5px] text-sub truncate">${d != null ? `${fmtDist(d)} · 도보 약 ${walkMin(d)}분` : ''}${hasNumbers(live) ? ` · ${(DATA_SOURCE[live.dataSource] || {}).dot} 실시간 연결` : ' · 실시간 데이터 없음'}</p></button>
+        ${hasNumbers(live) ? `<span class="text-[15px] font-black tnum st-${st.key} shrink-0">${fmt(live.available)}</span>` : ''}
+        <button data-act="nav" data-id="${f.id}" class="press w-11 h-11 rounded-full bg-card2 border border-line grid place-items-center shrink-0" aria-label="${esc(f.name)} 길안내"><i class="fa-solid fa-route text-brand" aria-hidden="true"></i></button>
+      </div>`; }).join('')}
+      ${nb.radius < CONFIG.NEARBY_PARKING_RADIUS_MAX ? `<button data-act="nearby-expand" class="w-full min-h-[48px] text-[13px] font-bold text-brand">반경 ${fmtDist(CONFIG.NEARBY_PARKING_RADIUS_MAX)}까지 더 보기</button>` : ''}</div>`;
+  return `<section id="nearbyParking" class="scroll-mt-4" aria-label="주변 주차장">${head}${body}</section>`;
+}
+
+function noParkingDataHTML(d) {
+  return `<section class="card p-5" aria-label="주차 데이터 없음">
+    <p class="font-bold text-[15px]">⚪ 실시간 주차 데이터 없음</p>
+    <p class="text-[12.5px] text-sub mt-1 leading-snug">현재 잔여 주차면을 확인할 수 없습니다. 파킹뷰에 이 장소의 공식 주차장 정보가 아직 등록되지 않았어요.</p>
+    <div class="mt-3 grid grid-cols-2 gap-2">
+      <button data-act="scroll-nearby" class="press h-11 rounded-xl bg-brand text-white text-[13px] font-bold"><i class="fa-solid fa-square-parking mr-1.5" aria-hidden="true"></i>주변 주차장 보기</button>
+      <button data-act="nav" data-id="${d.id}" class="press h-11 rounded-xl bg-card2 border border-line text-[13px] font-bold"><i class="fa-solid fa-route mr-1.5 text-brand" aria-hidden="true"></i>목적지 길안내</button>
+    </div>
+  </section>`;
+}
+
 function renderExplore() {
   renderChips();
   const box = $('#dashboard');
   const d = getDestination(state.selectedDestId);
   if (!d) {
-    const waiting = state.sources.REFERENCE !== 'ok' || (state.pendingDestId && ['idle', 'loading'].includes(state.sources.PUBLIC_API));
+    const waiting = state.sources.REFERENCE !== 'ok' || (state.pendingDestId && CONFIG.LIVE_SOURCES.some(s => ['idle', 'loading'].includes(state.sources[s])));
     box.innerHTML = waiting ? skeletonExplore() : errorCardHTML('주차장 정보를 불러오지 못했습니다.');
     return;
   }
   const fs = facilitiesOf(d);
   let f = getFacility(state.selectedFacilityId);
-  if (!f || !fs.includes(f)) { f = fs[0]; state.selectedFacilityId = f ? f.id : null; }
-  if (!f) { box.innerHTML = destinationHeaderHTML(d, [], null) + '<div class="card p-6 text-center text-[13px] text-sub">등록된 주차시설이 없습니다.</div>'; return; }
+  if (f && !fs.includes(f) && !f.external) f = null;
+  if (!f) { f = fs[0] || null; state.selectedFacilityId = f ? f.id : null; }
 
+  // 외부 주차장을 직접 연 경우: 그 주차장 하나를 기준으로 표시
+  const viewingExternal = f && f.external && !fs.includes(f);
+  const footer = `<p class="text-center text-[11px] text-sub py-2 leading-relaxed">숫자가 없는 곳은 실시간 데이터가 연결되지 않은 곳이에요.<br/>공식 정보는 운영사 사정으로 바뀔 수 있으니 방문 전 확인하세요.</p>`;
+  if (!f) { // 목적지는 있지만 주차 데이터 없음 (정상 상태)
+    box.innerHTML = `${sourceErrorBanner()}${demoBanner()}${destinationHeaderHTML(d, [], null)}${noParkingDataHTML(d)}${guideCardHTML(d, null)}${nearbyParkingSectionHTML(d)}${footer}`;
+    return;
+  }
   const fst = facilityStatus(f), st = fst.status;
   const alts = getAlternatives(d, f);
-  const crowded = isCrowded(st), isFull = st && st.key === 'full';
+  const crowded = isCrowded(st), isFull = st && (st.key === 'full' || st.key === 'very');
   const live = getLive(f.id);
-  const bestId = live && live.floors ? (f.floors.map(fl => ({ id: fl.id, x: live.floors[fl.id] })).filter(o => o.x).sort((a, b) => b.x.available - a.x.available)[0] || {}).id : null;
+  const dFloors = displayFloors(f);
+  const bestId = live && live.floors ? (dFloors.map(fl => ({ id: fl.id, x: live.floors[fl.id] })).filter(o => o.x && o.x.total).sort((a, b) => b.x.available - a.x.available)[0] || {}).id : null;
 
   const floorsHTML = `
     <section aria-label="층별 현황">
       <div class="flex items-end justify-between mb-2.5 px-1 gap-2">
-        <div><h3 class="text-[17px] font-extrabold">층별 현황</h3><p class="text-[12px] text-sub mt-0.5">${esc(f.name)}${live && live.floors ? '' : ' · 실시간 층별 잔여석 미연결'}</p></div>
-        ${live && live.floors ? `<div class="flex gap-2 text-[10.5px] font-semibold text-sub shrink-0">${legendHTML()}</div>` : ''}
+        <div><h3 class="text-[17px] font-extrabold">층별·구역별 현황</h3><p class="text-[12px] text-sub mt-0.5">${esc(f.name)}${live && live.floors ? ` · ${(DATA_SOURCE[live.dataSource] || {}).dot || ''} ${(DATA_SOURCE[live.dataSource] || {}).label || ''}` : hasNumbers(live) ? ' · 층별 실시간 정보 제공되지 않음' : ' · 층별 실시간 정보 없음'}</p></div>
+        ${live && live.floors ? `<div class="flex flex-wrap justify-end gap-x-2 text-[10.5px] font-semibold text-sub shrink-0 max-w-[45%]">${legendHTML()}</div>` : ''}
       </div>
-      ${f.floors.length ? `<div class="space-y-2.5">${f.floors.map(fl => floorCardHTML(f, fl, bestId)).join('')}</div>`
+      ${dFloors.length ? `<div class="space-y-2.5">${dFloors.map(fl => floorCardHTML(f, fl, bestId)).join('')}</div>`
         : `<div class="card p-5"><p class="font-bold text-[14px]">층 정보 미등록</p><p class="text-[12.5px] text-sub mt-1 leading-snug">공식 층 구성 정보가 아직 확인되지 않았어요. 현장 제보는 '전체'로 남길 수 있어요.</p>
            <div class="mt-3 pt-2.5 border-t border-line text-[11.5px] flex items-center gap-1"><i class="fa-solid fa-user-check text-sub" aria-hidden="true"></i><span class="text-sub">${reportSummary(f.id, '전체').text}</span></div></div>`}
     </section>`;
-
-  const altsHTML = `
+  const altsHTML = alts.length || crowded ? `
     <section id="alts" class="scroll-mt-4" aria-label="대체 주차장">
       <div class="flex items-end justify-between mb-2.5 px-1">
-        <div><h3 class="text-[17px] font-extrabold">${crowded ? '대체 주차장' : '같은 곳·주변 등록 주차장'}</h3><p class="text-[12px] text-sub mt-0.5">파킹뷰에 등록된 주차장만 · 반경 ${CONFIG.ALT_RADIUS_M}m</p></div>
+        <div><h3 class="text-[17px] font-extrabold">대체 주차장</h3><p class="text-[12px] text-sub mt-0.5">검증 가이드 · 같은 목적지 · 반경 ${CONFIG.ALT_RADIUS_M}m 실시간 주차장</p></div>
         <span class="text-[12px] font-bold text-brand">${alts.length}곳</span>
       </div>
-      <div class="space-y-2.5">${alts.length ? alts.slice(0, 6).map(altCardHTML).join('') : `
-        <div class="card p-6 text-center"><i class="fa-solid fa-map text-2xl text-sub" aria-hidden="true"></i><p class="mt-2 text-[13.5px] font-semibold">주변 ${CONFIG.ALT_RADIUS_M}m 안에 등록된 주차장이 없습니다.</p>
-          <button data-act="tab" data-tab="nearby" class="press mt-3 h-11 px-4 rounded-full bg-card2 border border-line text-[13px] font-bold">내 주변에서 더 찾기</button></div>`}</div>
-    </section>`;
+      <div class="space-y-2.5">${alts.length ? alts.slice(0, 5).map(altCardHTML).join('')
+        : `<div class="card p-5 text-center"><p class="text-[13.5px] font-semibold">실시간 데이터가 있는 대체 주차장이 주변 ${CONFIG.ALT_RADIUS_M}m 안에 없습니다.</p><p class="text-[12px] text-sub mt-1">아래 '주변 주차장'에서 실제 주차장 위치를 확인하세요.</p></div>`}</div>
+    </section>` : '';
 
   box.innerHTML = `
     ${sourceErrorBanner()}${demoBanner()}
-    ${destinationHeaderHTML(d, fs, f)}
+    ${destinationHeaderHTML(d, viewingExternal ? [] : fs, f)}
+    ${viewingExternal ? `<button data-act="goto" data-id="${d.id}" class="press h-11 px-4 rounded-full bg-card2 border border-line text-[13px] font-bold"><i class="fa-solid fa-arrow-left mr-1.5" aria-hidden="true"></i>${esc(d.name)} 주차 정보로 돌아가기</button>` : ''}
     ${crowded ? warningHTML(f, st, alts) : ''}
     ${facilityCardHTML(d, f)}
+    ${isFull ? altsHTML + floorsHTML : floorsHTML}
     ${guideCardHTML(d, f)}
-    ${isFull ? altsHTML + floorsHTML : floorsHTML + altsHTML}
-    <p class="text-center text-[11px] text-sub py-2 leading-relaxed">숫자가 없는 곳은 실시간 데이터가 연결되지 않은 곳이에요.<br/>공식 정보는 운영사 사정으로 바뀔 수 있으니 방문 전 확인하세요.</p>`;
+    ${isFull ? '' : altsHTML}
+    ${nearbyParkingSectionHTML(d)}
+    ${footer}`;
 }
 
-/* ---- 12-6. 검색 자동완성 ---- */
+/* ---- 12-6. 통합 검색 (목적지 📍 / 주차장 🚗 구분) ---- */
+function destBadge(d) {
+  const ls = destLiveSummary(d);
+  if (ls) return statusPill(ls.status, ls.available, 'shrink-0');
+  if (d.kind === 'destination' && facilitiesOf(d).some(f => f.info)) return '<span class="shrink-0 text-[11px] font-semibold text-sub bg-card2 border border-line rounded-full px-2 py-0.5">⚪ 시설 정보</span>';
+  return noLivePill('실시간 주차 데이터 없음', 'shrink-0');
+}
+function resultRow({ act, id, icon, title, meta, right, q, kindLabel }) {
+  return `<button data-act="${act}" data-id="${esc(id)}" role="option" class="w-full min-h-[60px] flex items-center gap-3 px-4 py-2.5 text-left hover:bg-card2 active:bg-card2">
+    <span class="w-9 h-9 rounded-xl bg-card2 grid place-items-center text-sub shrink-0" aria-hidden="true"><i class="fa-solid ${icon}"></i></span>
+    <span class="flex-1 min-w-0"><span class="block text-[14.5px] font-semibold truncate">${highlight(title, q)}</span><span class="block text-[11.5px] text-sub truncate"><b class="text-ink/80">${kindLabel}</b> · ${meta}</span></span>
+    ${right}</button>`;
+}
 function suggestItem(d, q) {
-  const fs = facilitiesOf(d), ls = destLiveSummary(d), cat = CATEGORY[d.category] || CATEGORY.shopping;
+  const fs = facilitiesOf(d), cat = CATEGORY[d.category] || CATEGORY.place;
   const fr = fs.map(floorRangeText).filter(Boolean)[0];
   const dist = state.geo.pos ? distanceBetween(state.geo.pos, d) : null;
-  const meta = [cat.label, d.kind === 'public_lot' ? null : fr ? `🅿️ 주차 ${fr}` : '🅿️ 층 정보 미등록', dist != null ? `📍 ${fmtDist(dist)}` : null].filter(Boolean).join(' · ');
-  return `<button data-act="pick" data-id="${d.id}" role="option" class="w-full min-h-[60px] flex items-center gap-3 px-4 py-2.5 text-left hover:bg-card2 active:bg-card2">
-    <span class="w-9 h-9 rounded-xl bg-card2 grid place-items-center text-sub shrink-0" aria-hidden="true"><i class="fa-solid ${cat.icon}"></i></span>
-    <span class="flex-1 min-w-0"><span class="block text-[14.5px] font-semibold truncate">${highlight(d.name, q)}</span><span class="block text-[12px] text-sub truncate">${meta}</span></span>
-    ${ls ? statusPill(ls.status, ls.available, 'shrink-0') : noLivePill('실시간 미연결', 'shrink-0')}
-  </button>`;
+  const isLot = d.kind === 'public_lot';
+  const meta = [cat.label, isLot ? null : fr ? `🅿️ 주차 ${fr}` : null, dist != null ? `📍 ${fmtDist(dist)}` : null].filter(Boolean).join(' · ');
+  return resultRow({ act: 'pick', id: d.id, icon: isLot ? 'fa-square-parking' : cat.icon, title: d.name, meta, right: destBadge(d), q, kindLabel: isLot ? '🚗 주차장' : '📍 목적지' });
 }
 function renderSuggest() {
   const q = $('#searchInput').value.trim();
   $('#searchClear').classList.toggle('hidden', !q);
   let html = '';
   const chip = x => `<button data-act="use-query" data-q="${esc(x)}" class="h-9 px-3 rounded-full bg-card2 border border-line text-[12.5px] font-semibold">${esc(x)}</button>`;
+  const examples = ['용산 아이파크몰', '현대 판교', '스타필드 수원', '코엑스', '인천공항'];
   if (!q) {
     const rq = Store.data.recentQueries;
     if (rq.length) html += `<div class="px-4 pt-3 pb-1 flex justify-between items-center text-[11.5px] text-sub font-semibold"><span>최근 검색어</span><button data-act="clear-recent" class="h-9 px-2 text-brand">전체 삭제</button></div><div class="px-4 pb-2 flex flex-wrap gap-1.5">${rq.map(chip).join('')}</div>`;
     const rd = Store.data.recentDestinations.map(getDestination).filter(Boolean).slice(0, 3);
     if (rd.length) html += `<div class="px-4 pt-2 pb-1 text-[11.5px] text-sub font-semibold">최근 본 목적지</div>` + rd.map(d => suggestItem(d)).join('');
-    html += `<div class="px-4 pt-2 pb-1 text-[11.5px] text-sub font-semibold">이렇게 검색해보세요</div><div class="px-4 pb-3 flex flex-wrap gap-1.5">${['현대 판교', '스타필드 수원', '더현대', '코엑스', '인천공항'].map(chip).join('')}
-      ${state.destinations.some(d => d.kind === 'public_lot') ? '<button data-act="use-query" data-q="공영" class="h-9 px-3 rounded-full bg-brand/10 text-brand text-[12.5px] font-bold">서울 공영주차장</button>' : ''}</div>`;
+    html += `<div class="px-4 pt-2 pb-1 text-[11.5px] text-sub font-semibold">이렇게 검색해보세요</div><div class="px-4 pb-3 flex flex-wrap gap-1.5">${examples.map(chip).join('')}</div>`;
   } else {
-    const m = searchDestinations(q);
-    html = m.length ? m.map(d => suggestItem(d, q)).join('')
-      : `<div class="p-6 text-center"><p class="text-[14px] font-semibold">검색 결과가 없습니다.</p><p class="text-[12.5px] text-sub mt-1">다른 이름으로 검색해보세요.</p>
-         <div class="mt-3 flex flex-wrap justify-center gap-1.5">${['현대 판교', '스타필드 수원', '코엑스', '인천공항'].map(chip).join('')}</div></div>`;
+    const items = searchAll(q);
+    const ext = state.search.q === q ? state.search.status : 'idle';
+    html = items.map(it => {
+      if (it.type === 'dest') return suggestItem(it.d, q);
+      if (it.type === 'fac') { const f = it.f, d = destinationOfFacility(f), live = getLive(f.id), st = facilityStatus(f).status;
+        return resultRow({ act: 'facility', id: f.id, icon: 'fa-square-parking', title: f.name, meta: d ? esc(d.name) : '주차시설', q, kindLabel: '🚗 주차장',
+          right: hasNumbers(live) ? statusPill(st, live.available, 'shrink-0') : noLivePill('실시간 없음', 'shrink-0') }); }
+      const p = it.p, cat = CATEGORY[p.kind] || CATEGORY.place;
+      return resultRow({ act: it.type === 'place' ? 'pick-place' : 'pick-place-parking', id: p.id, icon: it.type === 'place' ? cat.icon : 'fa-square-parking',
+        title: p.name, meta: esc(p.roadAddress || p.address || p.category), q, kindLabel: it.type === 'place' ? '📍 목적지' : '🚗 주차장',
+        right: noLivePill('실시간 주차 데이터 없음', 'shrink-0') });
+    }).join('');
+    if (ext === 'loading') html += `<div class="px-4 py-3 flex items-center gap-2 text-[12px] text-sub"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>전국 장소를 검색하는 중…</div>`;
+    if (ext === 'error') html += `<div class="px-4 py-3 text-[12px] text-sub" role="alert">장소 검색 서비스에 연결하지 못했어요. 파킹뷰에 등록된 장소만 보여드려요. <button data-act="retry-search" class="h-9 px-2 font-bold text-brand">다시 시도</button></div>`;
+    if (!items.length && ext !== 'loading') {
+      html = `<div class="p-6 text-center"><p class="text-[14px] font-semibold">${ext === 'error' ? '검색 결과를 불러오지 못했습니다.' : '장소를 찾지 못했습니다.'}</p><p class="text-[12.5px] text-sub mt-1">다른 이름으로 검색해보세요.</p>
+         <div class="mt-3 flex flex-wrap justify-center gap-1.5">${examples.slice(0, 4).map(chip).join('')}</div></div>` + (ext === 'error' ? html : '');
+    }
+    if (items.length && state.search.external && state.search.q === q) html += `<p class="px-4 py-2 text-[10.5px] text-sub border-t border-line">장소 정보: ${state.search.external.provider === 'tmap' ? 'TMAP' : '카카오'} 장소 검색</p>`;
   }
   $('#suggest').innerHTML = html; $('#suggest').classList.remove('hidden');
 }
@@ -1474,20 +1975,20 @@ function renderNearby() {
 
   let rows = state.facilities.filter(hasCoords).map(f => ({ f, d: distanceBetween(ref, f), st: facilityStatus(f), live: getLive(f.id) }));
   if (state.nearbyRadius) rows = rows.filter(r => r.d <= state.nearbyRadius);
-  const rank = r => (r.live ? 0 : r.st.status ? 1 : 2) * 10 + (r.st.status ? STATUS_ORDER.indexOf(r.st.status.key) : 9);
+  const rank = r => (r.live && r.live.total != null ? 0 : r.st.status ? 1 : 2) * 10 + (r.st.status ? STATUS_ORDER.indexOf(r.st.status.key) : 9);
   rows.sort(state.nearbySort === 'distance' ? (a, b) => a.d - b.d : (a, b) => rank(a) - rank(b) || a.d - b.d);
-  const loadingMore = state.sources.PUBLIC_API === 'loading' ? `<div class="card p-3.5 flex items-center gap-3" aria-busy="true"><div class="skel w-12 h-12 !rounded-2xl"></div><div class="flex-1 space-y-2"><div class="skel h-4 w-2/3"></div><div class="skel h-3 w-1/3"></div></div></div><p class="text-center text-[11.5px] text-sub">서울시 공영주차장 실시간 정보를 불러오는 중…</p>` : '';
+  const loadingMore = CONFIG.LIVE_SOURCES.some(s => state.sources[s] === 'loading') ? `<div class="card p-3.5 flex items-center gap-3" aria-busy="true"><div class="skel w-12 h-12 !rounded-2xl"></div><div class="flex-1 space-y-2"><div class="skel h-4 w-2/3"></div><div class="skel h-3 w-1/3"></div></div></div><p class="text-center text-[11.5px] text-sub">실시간 주차 데이터를 불러오는 중…</p>` : '';
   $('#nearbyList').innerHTML = (rows.length ? rows.slice(0, 30).map(r => {
     const st = r.st.status, dest = destinationOfFacility(r.f);
     return `<button data-act="preview" data-id="${r.f.id}" class="press w-full card p-3.5 flex items-center gap-3 text-left" aria-label="${esc(r.f.name)}, ${fmtDist(r.d)}">
       <div class="w-12 h-12 rounded-2xl grid place-items-center shrink-0 ${st ? 'st-' + st.key : 'text-sub bg-card2'}" style="${st ? `background:${st.color}1c` : ''}" aria-hidden="true"><i class="fa-solid fa-square-parking text-xl"></i></div>
       <div class="flex-1 min-w-0"><p class="font-bold text-[15px] truncate">${esc(r.f.name)}</p>
         <p class="text-[12px] text-sub mt-0.5 truncate"><span class="tnum">${fmtDist(r.d)}</span> · ${r.d <= 1500 ? `도보 약 ${walkMin(r.d)}분` : `차로 약 ${Math.max(1, Math.round(r.d / 500))}분`}${dest && dest.kind === 'destination' ? ` · ${esc(dest.name)}` : ''}</p></div>
-      <div class="text-right shrink-0">${r.live ? `<p class="text-[20px] leading-none font-black tnum st-${st.key}">${fmt(r.live.available)}</p><p class="text-[11px] font-bold mt-1 st-${st.key}">${statusLabel(st, r.live.available)}</p>` : st ? statusPill(st) : noLivePill('미연결')}</div>
+      <div class="text-right shrink-0">${r.live && r.live.total != null ? `<p class="text-[20px] leading-none font-black tnum st-${st.key}">${fmt(r.live.available)}</p><p class="text-[11px] font-bold mt-1 st-${st.key}">${statusLabel(st, r.live.available)}</p>` : st ? statusPill(st) : noLivePill('미연결')}</div>
     </button>`; }).join('')
     : `<div class="card p-6 text-center"><i class="fa-solid fa-magnifying-glass-location text-2xl text-sub" aria-hidden="true"></i><p class="mt-2 text-[14px] font-semibold">주변 ${fmtDist(state.nearbyRadius)} 안에 등록된 주차장이 없습니다.</p>
        <button data-act="radius" data-r="0" class="press mt-3 h-11 px-4 rounded-full bg-card2 border border-line text-[13px] font-bold">반경 넓혀서 전체 보기</button></div>`)
-    + loadingMore + (state.sources.PUBLIC_API === 'error' ? sourceErrorBanner() : '');
+    + loadingMore + sourceErrorBanner();
   renderMarkers();
 }
 function initMap() {
@@ -1502,9 +2003,9 @@ function initMap() {
 function renderMarkers() {
   if (!state.map || !state.markerLayer) return;
   state.markerLayer.clearLayers();
-  state.facilities.filter(hasCoords).forEach(f => {
+  state.facilities.filter(f => hasCoords(f) && (!f.external || CONFIG.SHOW_EXTERNAL_ON_MAP)).forEach(f => {
     const st = facilityStatus(f).status, live = getLive(f.id);
-    const html = st ? `<span class="pin" style="--c:${st.color};--fg:${st.onColor}"><i class="fa-solid ${st.icon}"></i>${live ? fmt(live.available) : st.label}</span>` : `<span class="pin" style="--c:#94a3b8"><i class="fa-solid fa-square-parking"></i>P</span>`;
+    const html = st ? `<span class="pin" style="--c:${st.color};--fg:${st.onColor}"><i class="fa-solid ${st.icon}"></i>${live && live.total != null ? fmt(live.available) : st.label}</span>` : `<span class="pin" style="--c:#94a3b8"><i class="fa-solid fa-square-parking"></i>P</span>`;
     L.marker([f.lat, f.lng], { icon: L.divIcon({ className: 'pin-wrap', iconSize: [90, 30], iconAnchor: [45, 34], html }), title: f.name }).on('click', () => openFacilityPreview(f.id)).addTo(state.markerLayer);
   });
   if (state.geo.pos) L.marker([state.geo.pos.lat, state.geo.pos.lng], { icon: L.divIcon({ className: '', html: '<div class="me-dot"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }), zIndexOffset: 2000, title: '현재 위치' }).addTo(state.markerLayer);
@@ -1519,7 +2020,8 @@ function reportFormHTML() {
   const named = state.destinations.filter(x => x.kind === 'destination').sort((a, b) => a.name.localeCompare(b.name, 'ko'));
   const publicLots = state.destinations.filter(x => x.kind === 'public_lot').sort((a, b) => a.name.localeCompare(b.name, 'ko'));
   const opt = fac => `<option value="${fac.id}" ${fac.id === f.id ? 'selected' : ''}>${esc(fac.name)}</option>`;
-  const opts = named.map(dest => { const fs = facilitiesOf(dest).filter((x, i, arr) => arr.indexOf(x) === i); return `<optgroup label="${esc(dest.name)}">${fs.map(opt).join('')}</optgroup>`; }).join('')
+  const extOpt = f.external ? `<optgroup label="선택한 주차장">${opt(f)}</optgroup>` : '';
+  const opts = extOpt + named.map(dest => { const fs = facilitiesOf(dest).filter((x, i, arr) => arr.indexOf(x) === i); return `<optgroup label="${esc(dest.name)}">${fs.map(opt).join('')}</optgroup>`; }).join('')
     + (publicLots.length ? `<optgroup label="서울 공영주차장">${publicLots.map(dest => facilitiesOf(dest).map(opt).join('')).join('')}</optgroup>` : '');
   const floors = reportFloorsOf(f), cols = Math.min(floors.length, 4);
   const elig = d.floorId ? pointEligibility(f.id, d.floorId) : { eligible: true };
@@ -1534,7 +2036,7 @@ function reportFormHTML() {
       </div></div>
     <div class="mt-5"><p class="text-[12.5px] font-bold text-sub" id="statusLabel">③ 지금 상황</p>
       <div class="grid grid-cols-2 gap-2.5 mt-2" role="radiogroup" aria-labelledby="statusLabel">
-        ${STATUS_ORDER.map(k => { const s = STATUS[k], sel = d.status === k; return `
+        ${REPORT_STATUS_ORDER.map(k => { const s = STATUS[k], sel = d.status === k; return `
           <button data-act="draft-status" data-status="${k}" role="radio" aria-checked="${sel}" class="press rounded-2xl p-3.5 text-left border-2 min-h-[84px]" style="border-color:${sel ? s.color : s.color + '40'};background:${s.color}${sel ? '26' : '10'}">
             <div class="flex items-center justify-between"><i class="fa-solid ${s.icon} text-[20px] st-${k}" aria-hidden="true"></i>${sel ? `<i class="fa-solid fa-check st-${k}" aria-hidden="true"></i>` : ''}</div>
             <p class="mt-2 text-[17px] font-extrabold st-${k}">${s.label}</p><p class="text-[11.5px] text-sub">${s.desc}</p></button>`; }).join('')}
@@ -1603,9 +2105,10 @@ function renderMy() {
       <div class="mt-1 divide-y divide-line">${favs.map(d => `<button data-act="goto" data-id="${d.id}" class="w-full min-h-[48px] flex items-center gap-3 py-2.5 text-left"><i class="fa-solid fa-star text-amber-400" aria-hidden="true"></i><span class="flex-1 font-semibold text-[14.5px] truncate">${esc(d.name)}</span><i class="fa-solid fa-chevron-right text-sub text-xs" aria-hidden="true"></i></button>`).join('')}</div></section>` : ''}
     <section class="card divide-y divide-line overflow-hidden" aria-label="설정">
       <button data-act="toggle-theme" role="switch" aria-checked="${dark}" class="w-full min-h-[52px] flex items-center gap-3 px-4 text-left"><i class="fa-solid fa-circle-half-stroke w-5 text-center text-sub" aria-hidden="true"></i><span class="flex-1 font-semibold text-[14.5px]">다크 모드</span>${toggle(dark)}</button>
-      <button data-act="toggle-demo" role="switch" aria-checked="${demo}" class="w-full min-h-[60px] flex items-center gap-3 px-4 py-2 text-left"><i class="fa-solid fa-flask w-5 text-center text-sub" aria-hidden="true"></i><span class="flex-1"><span class="block font-semibold text-[14.5px]">데모 모드</span><span class="block text-[11.5px] text-sub">가상 수치로 혼잡·가이드 기능 체험 (실제 현황 아님)</span></span>${toggle(demo)}</button>
-      <div class="min-h-[52px] flex items-center gap-3 px-4 py-2"><i class="fa-solid fa-database w-5 text-center text-sub" aria-hidden="true"></i><span class="flex-1 font-semibold text-[14.5px]">실시간 데이터</span>
-        <span class="text-[11.5px] font-bold text-sub">서울시 공영주차장 ${state.sources.PUBLIC_API === 'ok' ? `✓ ${state.destinations.filter(d => d.kind === 'public_lot').length}곳` : state.sources.PUBLIC_API === 'error' ? '✕ 연결 실패' : '…'}</span></div>
+      ${DEV_MODE ? `<button data-act="toggle-demo" role="switch" aria-checked="${demo}" class="w-full min-h-[60px] flex items-center gap-3 px-4 py-2 text-left"><i class="fa-solid fa-flask w-5 text-center text-sub" aria-hidden="true"></i><span class="flex-1"><span class="block font-semibold text-[14.5px]">데모 모드</span><span class="block text-[11.5px] text-sub">개발 전용 · 가상 수치 (DEV_MODE)</span></span>${toggle(demo)}</button>` : ''}
+      <div class="px-4 py-3"><p class="flex items-center gap-3 font-semibold text-[14.5px]"><i class="fa-solid fa-database w-5 text-center text-sub" aria-hidden="true"></i>실시간 데이터 소스</p>
+        <ul class="mt-2 ml-8 space-y-1 text-[12px]">${CONFIG.LIVE_SOURCES.map(id => { const a = PARKING_DATA_SOURCES[id], st2 = state.sources[id], n = Object.keys(state.liveBySource[id] || {}).length;
+          return `<li class="flex items-center justify-between gap-2"><span>${esc(a.label)}</span><span class="font-bold ${st2 === 'ok' ? 'st-free' : st2 === 'error' ? 'text-sub' : 'text-sub'}">${st2 === 'ok' ? `✓ ${n}곳` : st2 === 'disabled' ? '설정 전' : st2 === 'error' ? (a.optional ? '미연결' : '✕ 실패') : '…'}</span></li>`; }).join('')}</ul></div>
       <button data-act="reset" class="w-full min-h-[52px] flex items-center gap-3 px-4 text-left st-full"><i class="fa-solid fa-rotate-left w-5 text-center" aria-hidden="true"></i><span class="flex-1 font-semibold text-[14.5px]">내 기록 초기화</span></button>
     </section>
     <p class="text-center text-[11px] text-sub">포인트·제보 기록은 이 기기의 브라우저(LocalStorage)에만 저장돼요.</p>
@@ -1624,13 +2127,14 @@ function openFacilityPreview(id) {
   const f = getFacility(id); if (!f) return;
   const fst = facilityStatus(f), live = getLive(f.id), d = state.geo.pos ? distanceBetween(state.geo.pos, f) : null, dest = destinationOfFacility(f);
   Sheet.open(`<div class="flex items-start justify-between gap-3"><div class="min-w-0">
-      <div class="flex flex-wrap gap-1.5">${fst.status ? statusPill(fst.status, live ? live.available : 1) : noLivePill()}${live ? liveSourceLine(live) : ''}</div>
-      <h3 class="text-[19px] font-extrabold mt-2 leading-tight">${esc(f.name)}</h3><p class="text-[12.5px] text-sub mt-1 truncate">${esc(dest ? dest.address : '')}${d != null ? ` · ${fmtDist(d)}` : ''}</p></div>
-      ${live ? `<div class="text-right shrink-0"><p class="text-[32px] leading-none font-black tnum st-${fst.status.key}">${fmt(live.available)}</p><p class="text-[11.5px] text-sub mt-1">/ ${fmt(live.total)}석</p></div>` : ''}</div>
-    ${live ? '' : '<p class="mt-3 text-[12.5px] text-sub">실시간 잔여석 데이터가 없습니다.</p>'}
+      <div class="flex flex-wrap gap-1.5">${fst.status ? statusPill(fst.status, live && live.total != null ? live.available : 1) : noLivePill()}${live ? liveSourceLine(live) : fst.basis === 'report' ? '<span class="text-[11px] font-bold">🔵 현장 제보</span>' : ''}</div>
+      <h3 class="text-[19px] font-extrabold mt-2 leading-tight">${esc(f.name)}</h3><p class="text-[12.5px] text-sub mt-1 truncate">${esc(dest ? dest.address : f.address || '')}${d != null ? ` · ${fmtDist(d)}` : ''}</p>
+      ${f.external ? `<p class="text-[11px] text-sub mt-1">⚪ 시설 정보 · ${esc(f.info.provider)}</p>` : ''}</div>
+      ${live && live.total != null ? `<div class="text-right shrink-0"><p class="text-[32px] leading-none font-black tnum st-${fst.status.key}">${fmt(live.available)}</p><p class="text-[11.5px] text-sub mt-1">/ ${fmt(live.total)}석</p></div>` : ''}</div>
+    ${live && live.total != null ? '' : '<p class="mt-3 text-[12.5px] text-sub">실시간 잔여석 데이터가 없습니다.</p>'}
     <div class="mt-5 grid grid-cols-2 gap-2">
       <button data-act="nav" data-id="${f.id}" class="press h-12 rounded-2xl bg-card2 border border-line font-bold"><i class="fa-solid fa-route mr-1.5 text-brand" aria-hidden="true"></i>길안내</button>
-      <button data-act="facility" data-id="${f.id}" class="press h-12 rounded-2xl bg-brand text-white font-bold">상세 보기</button></div>`, 'collapsed');
+      ${dest || getDestination(state.selectedDestId) ? `<button data-act="facility" data-id="${f.id}" class="press h-12 rounded-2xl bg-brand text-white font-bold">상세 보기</button>` : `<button data-act="open-report" data-id="${f.id}" class="press h-12 rounded-2xl bg-brand text-white font-bold">현장 제보</button>`}</div>`, 'collapsed');
 }
 function favRowHTML(d) {
   const on = Store.data.favorites.includes(d.id), cat = CATEGORY[d.category] || CATEGORY.shopping;
@@ -1674,9 +2178,17 @@ function selectDestination(id, { facilityId = null, silent = false } = {}) {
   renderExplore();
   if (state.tab !== 'explore' && !silent) switchTab('explore');
   if (!silent) window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (hasCoords(d) && !(state.nearby.destId === d.id && state.nearby.status === 'ok')) {
+    loadNearbyParking(d).then(() => { if (state.selectedDestId === d.id) softRender(); });
+  }
 }
 function selectFacility(fid) {
   const f = getFacility(fid); if (!f) return;
+  if (f.external) { // 주변(외부) 주차장: 현재 목적지 화면 안에서 그 주차장 기준으로 표시
+    if (!getDestination(state.selectedDestId)) { openFacilityPreview(fid); return; }
+    state.selectedFacilityId = fid; state.draft = { parkingId: fid, floorId: null, status: null };
+    renderExplore(); if (state.tab !== 'explore') switchTab('explore'); window.scrollTo({ top: 0, behavior: 'smooth' }); return;
+  }
   const d = destinationOfFacility(f);
   if (d && d.id === state.selectedDestId) {
     state.selectedFacilityId = fid; state.draft = { parkingId: fid, floorId: null, status: null };
@@ -1718,6 +2230,7 @@ async function locate(fromNearby, { quiet = false } = {}) {
 }
 function applyTheme(t) { document.documentElement.dataset.theme = t; $('#themeIcon').className = `fa-solid ${t === 'dark' ? 'fa-sun' : 'fa-moon'}`; }
 function setDemo(on) {
+  if (!DEV_MODE) return; // Production 에서는 데모 불가
   Store.data.settings.demo = on; Store.save();
   Repository.loadReports();
   toast(on ? '데모 모드를 켰어요. 가상 수치가 표시됩니다' : '데모 모드를 껐어요', 'info');
@@ -1732,7 +2245,23 @@ document.addEventListener('click', e => {
   switch (act) {
     case 'tab': Sheet.close(); switchTab(el.dataset.tab); break;
     case 'pick': { const q = $('#searchInput').value.trim(); if (q) rememberQuery(q); $('#searchInput').value = ''; $('#searchClear').classList.add('hidden'); hideSuggest(); $('#searchInput').blur(); selectDestination(id); break; }
-    case 'use-query': $('#searchInput').value = el.dataset.q; renderSuggest(); $('#searchInput').focus(); break;
+    case 'use-query': $('#searchInput').value = el.dataset.q; scheduleExternalSearch(); renderSuggest(); $('#searchInput').focus(); break;
+    case 'retry-search': PlaceSearchAdapter.cache.clear(); state.search = { q: '', external: null, status: 'idle' }; scheduleExternalSearch(); break;
+    case 'pick-place': case 'pick-place-parking': {
+      const p = state.search.external && state.search.external.places.find(x => x.id === id); if (!p) break;
+      const q = $('#searchInput').value.trim(); if (q) rememberQuery(q);
+      $('#searchInput').value = ''; $('#searchClear').classList.add('hidden'); hideSuggest(); $('#searchInput').blur();
+      if (act === 'pick-place-parking') { let f = getFacility('pk-' + p.id); if (!f) { f = facilityFromPlace(p); state.facilities.push(f); } openFacilityPreview(f.id); break; }
+      let d = getDestination('place-' + p.id);
+      if (!d) { d = destinationFromPlace(p); state.destinations.push(d); }
+      Store.data.placeSnapshots[d.id] = { id: d.id, kind: 'external', provider: d.provider, name: d.name, category: d.category, placeCategory: d.placeCategory, address: d.address, lat: d.lat, lng: d.lng, phone: d.phone, url: d.url, aliases: [], keywords: [], guide: null };
+      const keys = Object.keys(Store.data.placeSnapshots); if (keys.length > 40) delete Store.data.placeSnapshots[keys[0]];
+      selectDestination(d.id);
+      break;
+    }
+    case 'nearby-expand': { const d = getDestination(state.selectedDestId); if (d) { loadNearbyParking(d, CONFIG.NEARBY_PARKING_RADIUS_MAX).then(softRender); renderExplore(); } break; }
+    case 'nearby-retry': { const d = getDestination(state.selectedDestId); if (d) { NearbyParkingAdapter.cache.clear(); loadNearbyParking(d, state.nearby.radius || CONFIG.NEARBY_PARKING_RADIUS).then(softRender); renderExplore(); } break; }
+    case 'scroll-nearby': document.getElementById('nearbyParking')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); break;
     case 'goto': Sheet.close(); selectDestination(id); break;
     case 'facility': Sheet.close(); selectFacility(id); break;
     case 'clear-recent': Store.data.recentQueries = []; Store.data.recentDestinations = []; Store.save(); renderSuggest(); break;
@@ -1786,9 +2315,29 @@ document.addEventListener('change', e => { if (e.target.dataset.change === 'draf
 
 const searchInput = $('#searchInput');
 searchInput.addEventListener('focus', renderSuggest);
-searchInput.addEventListener('input', renderSuggest);
+let searchTimer = null;
+/** 외부 장소 검색 (debounce + 캐시 + 중복 호출 방지). 결과는 state.search 에 저장 후 재렌더 */
+function scheduleExternalSearch() {
+  const q = searchInput.value.trim();
+  clearTimeout(searchTimer);
+  if (!CONFIG.PLACE_SEARCH.enabled || q.length < CONFIG.PLACE_SEARCH.minChars) { state.search = { q, external: null, status: 'idle' }; return; }
+  if (state.search.q === q && ['ok', 'loading'].includes(state.search.status)) return;
+  state.search = { q, external: null, status: 'loading' };
+  searchTimer = setTimeout(async () => {
+    try {
+      const r = await PlaceSearchAdapter.search(q, state.geo.pos || null);
+      if (searchInput.value.trim() !== q) return;
+      state.search = { q, external: r, status: 'ok' };
+    } catch (e) {
+      if (searchInput.value.trim() !== q) return;
+      state.search = { q, external: null, status: 'error' };
+    }
+    if (!$('#suggest').classList.contains('hidden')) renderSuggest();
+  }, CONFIG.PLACE_SEARCH.debounceMs);
+}
+searchInput.addEventListener('input', () => { scheduleExternalSearch(); renderSuggest(); });
 searchInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter') { e.preventDefault(); const first = $('#suggest [data-act="pick"]'); if (first) first.click(); }
+  if (e.key === 'Enter') { e.preventDefault(); const first = $('#suggest [role="option"]'); if (first) first.click(); }
   if (e.key === 'Escape') { hideSuggest(); searchInput.blur(); }
 });
 $('#searchClear').addEventListener('click', e => { e.stopPropagation(); searchInput.value = ''; renderSuggest(); searchInput.focus(); });
@@ -1803,7 +2352,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { Sheet.clos
  * ===================================================================== */
 function softRender() {
   if (document.hidden || state.sheetOpen) return;
-  if (state.tab === 'explore' && $('#suggest').classList.contains('hidden')) renderExplore();
+  if (state.tab === 'explore') renderExplore(); // 검색 제안 목록은 별도 요소라 영향 없음
   if (state.tab === 'nearby') renderNearby();
 }
 function refreshAgo() { $$('[data-ago]').forEach(el => (el.textContent = timeAgo(+el.dataset.ago))); }
@@ -1846,6 +2395,8 @@ function init() {
   renderExplore();
 
   Repository.loadReference();
+  // 외부 검색으로 열었던 목적지 복원 (즐겨찾기·최근 목록)
+  Object.values(Store.data.placeSnapshots || {}).forEach(s => { if (!getDestination(s.id)) state.destinations.push({ ...s, facilityIds: [], nearbyParkingIds: [] }); });
   Repository.loadReports();
   const last = Store.data.lastDestination;
   if (last && getDestination(last)) selectDestination(last, { silent: true });
