@@ -283,7 +283,11 @@
  * ===================================================================== */
 const CONFIG = {
   APP_NAME: '파킹뷰',
-  DATA_SOURCE: 'mock',            // 'mock' | 'public' | 'supabase'
+  DATA_SOURCE: 'hybrid',          // 'mock' | 'hybrid'(데모 + 서울시 실시간) | 'public' | 'supabase'
+
+  // Cloudflare Worker 프록시 (인증키는 Worker 에만 저장)
+  PROXY_URL: 'https://parkingview-proxy.ytw060125.workers.dev',
+  SEOUL_REFRESH_MS: 60000,        // 서울시 실시간 데이터 갱신 주기
 
   // 공공데이터포털(data.go.kr) — 예: 한국교통안전공단 주차정보 API (무료, 일일 트래픽 제한)
   PUBLIC_API: {
@@ -519,11 +523,26 @@ const DataService = {
     if (CONFIG.DATA_SOURCE === 'public') return this._fetchPublicLots();
     if (CONFIG.DATA_SOURCE === 'supabase') return this._supabase(`${CONFIG.SUPABASE.tables.lots}?select=*`);
     const now = Date.now();
-    return JSON.parse(JSON.stringify(MOCK_PARKING_LOTS)).map(l => {
+    const lots = JSON.parse(JSON.stringify(MOCK_PARKING_LOTS)).map(l => {
       l.floors.forEach(f => f.zones.forEach(zn => (zn.base = zn.available)));
       l.updatedAt = now - Math.round(Math.random() * 40000);
+      l.source = 'demo';
       return l;
     });
+    if (CONFIG.DATA_SOURCE === 'hybrid' && CONFIG.PROXY_URL) {
+      try { lots.push(...(await this.fetchSeoulLots())); }
+      catch (e) { console.warn('서울시 데이터 로드 실패', e); state.proxyError = true; }
+    }
+    return lots;
+  },
+
+  /** Worker /seoul/lots → 앱 스키마. 좌표 변환이 끝난 주차장만 반환 */
+  async fetchSeoulLots() {
+    const res = await fetch(CONFIG.PROXY_URL + '/seoul/lots');
+    if (!res.ok) throw new Error('proxy ' + res.status);
+    const j = await res.json();
+    state.seoulMeta = { count: j.count, geocoded: j.geocoded, pending: j.pending };
+    return (j.lots || []).filter(r => r.lat && r.lng && r.total > 0).map(mapSeoulLot);
   },
 
   async fetchReports() {
@@ -586,6 +605,40 @@ function mapPublicApiItem(item, realtime) {
     floors: [one('전체', '전체 구역', total, available)], updatedAt: Date.now(),
   };
 }
+
+/** 서울시 시영주차장 실시간(Worker 가공) → 앱 스키마 */
+function parseKst(s) { const t = s ? Date.parse(String(s).replace(' ', 'T') + '+09:00') : NaN; return isNaN(t) ? null : t; }
+function fmtHours(h) {
+  if (!h || !h.wdStart) return '-';
+  if (h.wdStart === '0000' && (h.wdEnd === '2400' || h.wdEnd === '0000')) return '24시간';
+  const f = t => `${String(t).slice(0, 2)}:${String(t).slice(2, 4)}`;
+  return `${f(h.wdStart)}~${f(h.wdEnd)}`;
+}
+function mapSeoulLot(r) {
+  const total = Math.max(0, Math.round(+r.total || 0));
+  const avail = Math.min(total, Math.max(0, Math.round(+r.available || 0)));
+  const f = r.fee || {};
+  const per10 = f.baseMin > 0 ? Math.round((f.baseCharge * 10) / f.baseMin) : 0;
+  let hourly = f.baseCharge || 0;
+  if (f.baseMin > 0 && f.baseMin < 60 && f.addMin > 0) hourly += Math.ceil((60 - f.baseMin) / f.addMin) * (f.addCharge || 0);
+  if (f.dayMax > 0) hourly = Math.min(hourly, f.dayMax);
+  const note = r.realtime
+    ? '층별 현황은 아직 없어요. 지금 계신 층의 상황을 제보해주세요!'
+    : '실시간 연계가 끊긴 주차장이라 수치가 부정확할 수 있어요.';
+  const lot = {
+    id: 'seoul-' + r.id, source: 'seoul', realtime: !!r.realtime,
+    name: r.name, shortName: String(r.name).replace(/\s*\((시|구)\)\s*$/, ''), hotspot: 'seoul',
+    address: '서울 ' + (r.addr || ''), lat: +r.lat, lng: +r.lng, type: 'public', tel: r.tel,
+    hours: fmtHours(r.hours),
+    fee: { per10min: per10, hourly, note: r.pay === 'N' ? '무료 주차장' : '' },
+    evChargers: null, keywords: ['서울', '공영', '시영', r.type || ''],
+    floors: [one('전체', '전체 구역', total, avail, [], note)],
+    updatedAt: parseKst(r.updatedAt) || Date.now(),
+  };
+  lot.floors[0].zones[0].base = avail;
+  return lot;
+}
+const feeText = n => (n > 0 ? `${fmt(n)}원` : '무료');
 
 /* =====================================================================
  * 5) LOCAL STORE (LocalStorage)
@@ -854,6 +907,9 @@ function heroHTML(lot, t, s) {
           <div class="flex items-center gap-1.5 mb-2">
             <span class="inline-flex items-center gap-1.5 text-[11.5px] font-bold px-2.5 py-1 rounded-full" style="background:${s.color}1c;color:${s.color}"><span class="live-dot" style="--c:${s.color}"></span>실시간 ${s.label}</span>
             <span class="text-[11px] font-semibold text-sub bg-card2 border border-line px-2 py-1 rounded-full">${lot.type === 'public' ? '공영' : '민영'}</span>
+            ${lot.source === 'seoul'
+              ? '<span class="text-[11px] font-bold px-2 py-1 rounded-full bg-brand/10 text-brand"><i class="fa-solid fa-circle-check mr-1"></i>서울시 공식</span>'
+              : '<span class="text-[11px] font-semibold px-2 py-1 rounded-full bg-card2 border border-dashed border-line text-sub">데모</span>'}
           </div>
           <h2 class="text-[22px] font-extrabold leading-tight tracking-tight">${esc(lot.name)}</h2>
           <p class="text-[12.5px] text-sub mt-1 truncate"><i class="fa-solid fa-location-dot mr-1"></i>${esc(lot.address)}</p>
@@ -876,9 +932,9 @@ function heroHTML(lot, t, s) {
     </div>
 
     <div class="grid grid-cols-3 border-t border-line divide-x divide-line text-center">
-      <div class="py-3"><p class="text-[11px] text-sub">10분당</p><p class="text-[14px] font-bold mt-0.5 tnum">${fmt(lot.fee.per10min)}원</p></div>
+      <div class="py-3"><p class="text-[11px] text-sub">10분당</p><p class="text-[14px] font-bold mt-0.5 tnum">${feeText(lot.fee.per10min)}</p></div>
       <div class="py-3"><p class="text-[11px] text-sub">운영</p><p class="text-[14px] font-bold mt-0.5">${esc(lot.hours)}</p></div>
-      <div class="py-3"><p class="text-[11px] text-sub">전기차 충전</p><p class="text-[14px] font-bold mt-0.5 tnum">${lot.evChargers}기</p></div>
+      <div class="py-3"><p class="text-[11px] text-sub">전기차 충전</p><p class="text-[14px] font-bold mt-0.5 tnum">${lot.evChargers == null ? '-' : lot.evChargers + '기'}</p></div>
     </div>
     ${lot.fee.note ? `<p class="px-5 pb-3 -mt-0.5 text-[12px] text-sub"><i class="fa-solid fa-ticket mr-1.5 text-brand"></i>${esc(lot.fee.note)}</p>` : ''}
 
@@ -886,7 +942,7 @@ function heroHTML(lot, t, s) {
       ${rep
         ? `<p class="flex items-center gap-2"><i class="fa-solid fa-users text-brand w-4 text-center"></i><span><b class="text-ink" data-ago="${rep.createdAt}">${timeAgo(rep.createdAt)}</b> 현장 유저 제보 기반${nRecent ? ` · 최근 30분 ${nRecent}건` : ''}</span></p>`
         : `<p class="flex items-center gap-2"><i class="fa-solid fa-users text-sub w-4 text-center"></i><span>아직 현장 제보가 없어요. 첫 제보를 남겨주세요.</span></p>`}
-      <p class="flex items-center gap-2"><i class="fa-solid fa-satellite-dish w-4 text-center"></i><span>주차장 센서 데이터 <span data-ago="${lot.updatedAt}">${timeAgo(lot.updatedAt)}</span> 갱신</span></p>
+      <p class="flex items-center gap-2"><i class="fa-solid fa-satellite-dish w-4 text-center"></i><span>${lot.source === 'seoul' ? '서울시 실시간 연계 데이터' : '주차장 센서 데이터(데모)'} <span data-ago="${lot.updatedAt}">${timeAgo(lot.updatedAt)}</span> 갱신</span></p>
     </div>
 
     <div class="p-3 grid grid-cols-2 gap-2">
@@ -964,8 +1020,8 @@ function altCardHTML(a, idx) {
       </div>
     </div>
     <div class="mt-3 grid grid-cols-2 gap-2 text-center">
-      <div class="rounded-xl bg-card2 py-2"><p class="text-[10.5px] text-sub">10분당</p><p class="text-[13.5px] font-bold tnum">${fmt(a.lot.fee.per10min)}원</p></div>
-      <div class="rounded-xl bg-card2 py-2"><p class="text-[10.5px] text-sub">1시간</p><p class="text-[13.5px] font-bold tnum">${fmt(a.lot.fee.hourly)}원</p></div>
+      <div class="rounded-xl bg-card2 py-2"><p class="text-[10.5px] text-sub">10분당</p><p class="text-[13.5px] font-bold tnum">${feeText(a.lot.fee.per10min)}</p></div>
+      <div class="rounded-xl bg-card2 py-2"><p class="text-[10.5px] text-sub">1시간</p><p class="text-[13.5px] font-bold tnum">${feeText(a.lot.fee.hourly)}</p></div>
     </div>
     <div class="mt-2.5 grid grid-cols-2 gap-2">
       <button data-act="nav" data-id="${a.lot.id}" class="press h-11 rounded-xl bg-brand text-white text-[13.5px] font-bold"><i class="fa-solid fa-route mr-1.5"></i>길안내</button>
@@ -1006,7 +1062,7 @@ function renderExplore() {
     ${crowded ? warningHTML(lot, s, alts) : ''}
     ${heroHTML(lot, t, s)}
     ${s.key === 'full' ? altsHTML + floorsHTML : floorsHTML + altsHTML}
-    <p class="text-center text-[11px] text-sub py-2">데모 데이터 · ${CONFIG.DATA_SOURCE === 'mock' ? '실시간 변동 시뮬레이션 중' : '공공데이터 + 크라우드소싱'}</p>`;
+    <p class="text-center text-[11px] text-sub py-2">${lot.source === 'seoul' ? '출처: 서울 열린데이터광장 (공공누리 1유형) · 1분마다 갱신' : '데모 데이터 · 실시간 변동 시뮬레이션 중'}</p>`;
 }
 
 /* =====================================================================
@@ -1067,7 +1123,7 @@ function renderNearby() {
       <div class="w-12 h-12 rounded-2xl grid place-items-center shrink-0" style="background:${r.s.color}1c;color:${r.s.color}"><i class="fa-solid fa-square-parking text-xl"></i></div>
       <div class="flex-1 min-w-0">
         <p class="font-bold text-[15px] truncate">${esc(r.l.name)}</p>
-        <p class="text-[12px] text-sub mt-0.5 truncate"><span class="tnum">${fmtDist(r.d)}</span> · ${r.d <= 1500 ? `도보 ${walkMin(r.d)}분` : `차로 약 ${Math.max(1, Math.round(r.d / 500))}분`} · 10분 ${fmt(r.l.fee.per10min)}원</p>
+        <p class="text-[12px] text-sub mt-0.5 truncate"><span class="tnum">${fmtDist(r.d)}</span> · ${r.d <= 1500 ? `도보 ${walkMin(r.d)}분` : `차로 약 ${Math.max(1, Math.round(r.d / 500))}분`} · 10분 ${feeText(r.l.fee.per10min)}</p>
       </div>
       <div class="text-right shrink-0"><p class="text-[20px] leading-none font-black tnum" style="color:${r.s.color}">${fmt(r.available)}</p><p class="text-[11px] font-bold mt-1" style="color:${r.s.color}">${r.s.label}</p></div>
     </button>`).join('');
@@ -1107,7 +1163,7 @@ function renderMarkers() {
 function reportFormHTML() {
   const lot = getLot(state.draft.lotId);
   const d = state.draft;
-  const opts = HOTSPOTS.map(h => `<optgroup label="${h.label}">${state.lots.filter(l => l.hotspot === h.id).map(l => `<option value="${l.id}" ${l.id === lot.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</optgroup>`).join('');
+  const opts = HOTSPOTS.filter(h => state.lots.some(l => l.hotspot === h.id)).map(h => `<optgroup label="${h.label}">${state.lots.filter(l => l.hotspot === h.id).sort((a, b) => a.name.localeCompare(b.name, 'ko')).map(l => `<option value="${l.id}" ${l.id === lot.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</optgroup>`).join('');
   const cols = Math.min(lot.floors.length, 4);
   return `
     <label class="block">
@@ -1253,7 +1309,7 @@ function renderMy() {
       </button>
       <div class="flex items-center gap-3 px-4 py-3.5">
         <i class="fa-solid fa-database w-5 text-center text-sub"></i><span class="flex-1 font-semibold text-[14.5px]">데이터 소스</span>
-        <span class="text-[12px] font-bold px-2 py-1 rounded-lg bg-card2 border border-line text-sub">${{ mock: '데모(가상 데이터)', public: '공공데이터포털', supabase: 'Supabase' }[CONFIG.DATA_SOURCE]}</span>
+        <span class="text-[12px] font-bold px-2 py-1 rounded-lg bg-card2 border border-line text-sub">${{ mock: '데모(가상 데이터)', hybrid: '데모 + 서울시 실시간', public: '공공데이터포털', supabase: 'Supabase' }[CONFIG.DATA_SOURCE]}</span>
       </div>
       <button data-act="reset" class="w-full flex items-center gap-3 px-4 py-3.5 text-left text-red-500">
         <i class="fa-solid fa-rotate-left w-5 text-center"></i><span class="flex-1 font-semibold text-[14.5px]">내 기록 초기화</span>
@@ -1514,9 +1570,10 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { Sheet.clos
  * 16) REALTIME SIMULATION (mock 전용) & 시간 표시 갱신
  * ===================================================================== */
 function tick() {
-  if (CONFIG.DATA_SOURCE !== 'mock' || !CONFIG.SIMULATE_REALTIME) return;
+  if (!CONFIG.SIMULATE_REALTIME || !['mock', 'hybrid'].includes(CONFIG.DATA_SOURCE)) return;
   const now = Date.now();
   state.lots.forEach(l => {
+    if (l.source === 'seoul') return; // 실제 데이터는 시뮬레이션하지 않음
     l.floors.forEach(f => f.zones.forEach(zn => {
       const step = Math.max(1, Math.round(zn.total * 0.025));
       const noise = Math.round((Math.random() * 2 - 1) * step);
@@ -1528,6 +1585,23 @@ function tick() {
   if (document.hidden) return;
   if (state.tab === 'explore' && !state.sheetOpen && $('#suggest').classList.contains('hidden')) renderExplore();
   if (state.tab === 'nearby' && !state.sheetOpen) renderNearby();
+}
+
+async function refreshSeoul() {
+  if (document.hidden) return;
+  try {
+    const fresh = await DataService.fetchSeoulLots();
+    fresh.forEach(nl => {
+      const cur = getLot(nl.id);
+      if (!cur) { state.lots.push(nl); return; }
+      cur.floors[0].zones[0].available = nl.floors[0].zones[0].available;
+      cur.floors[0].zones[0].total = nl.floors[0].zones[0].total;
+      cur.updatedAt = nl.updatedAt;
+    });
+    if (state.sheetOpen) return;
+    if (state.tab === 'explore' && $('#suggest').classList.contains('hidden')) renderExplore();
+    if (state.tab === 'nearby') renderNearby();
+  } catch (e) { console.warn('서울시 갱신 실패', e); }
 }
 
 function refreshAgo() { $$('[data-ago]').forEach(el => (el.textContent = timeAgo(+el.dataset.ago))); }
@@ -1568,6 +1642,14 @@ async function init() {
     CONFIG.DATA_SOURCE = 'mock';
     state.lots = await DataService.fetchLots();
     state.reports = await DataService.fetchReports();
+  }
+  const seoulLots = state.lots.filter(l => l.source === 'seoul');
+  if (seoulLots.length) {
+    const pick = getLot('seoul-171721') || seoulLots[0];
+    HOTSPOTS.push({ id: 'seoul', label: `서울 시영 ${seoulLots.length}곳`, icon: 'fa-city', lotId: pick.id });
+    setInterval(refreshSeoul, CONFIG.SEOUL_REFRESH_MS);
+  } else if (state.proxyError) {
+    toast('서울시 실시간 데이터를 불러오지 못했어요', 'error');
   }
   const startLot = getLot(Store.data.lastLot) ? Store.data.lastLot : 'gn-main';
   selectLot(startLot, { silent: true });
